@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行时数据（含个人敏感信息：手机号/通话记录，切勿提交）
+sent_sms.json
+call_history.json
+data_usage.json
+
+# WorkBuddy 项目数据
+.workbuddy/
+
+# 生成的图片素材与分享文案（非代码，不开源）
+*.png
+*.jpg
+*.jpeg
+*.webp
+cover_plan_*/
+xiaohongshu_post.md
+douyin_post.md
