@@ -1,0 +1,14 @@
+{
+  "name": "DJiPhone Kit",
+  "short_name": "DJiPhone",
+  "description": "QDC507 4G 模块短信 / 通话 / 流量助手",
+  "start_url": "/m",
+  "display": "standalone",
+  "background_color": "#0b0d14",
+  "theme_color": "#0b0d14",
+  "icons": [
+    { "src": "/app-icon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" },
+    { "src": "/app-icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/app-icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

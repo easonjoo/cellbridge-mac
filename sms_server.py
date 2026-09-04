@@ -13,7 +13,6 @@ import threading
 import uuid
 import usb.core
 import usb.util
-import psutil
 from flask import Flask, request, jsonify, send_file
 
 # ─── EG25-G USB Config ───────────────────────────────────────────────
@@ -122,20 +121,39 @@ class ModemManager:
                 self._disconnect()
                 raise RuntimeError(f"USB 通信失败: {e}")
 
+    @staticmethod
+    def _ucs2_encode(text):
+        """文本 → UCS2 hex 字符串（用于 AT+CSCS="UCS2" 下的号码/内容）。"""
+        return text.encode('utf-16-be').hex().upper()
+
+    @staticmethod
+    def _ucs2_decode(value):
+        """UCS2 hex 字符串 → 文本；非 hex 内容原样返回（兼容纯英文号码）。"""
+        v = value.strip().strip('"')
+        if not v:
+            return v
+        try:
+            if len(v) % 4 == 0 and all(c in '0123456789abcdefABCDEF' for c in v):
+                return bytes.fromhex(v).decode('utf-16-be')
+        except (ValueError, UnicodeDecodeError):
+            pass
+        return v
+
     def send_sms(self, phone, message):
-        """发送短信。"""
+        """发送短信（UCS2 编码，支持中英文）。"""
         with self._lock:
             if not self._ensure():
                 raise RuntimeError("EG25-G 模块未连接")
             try:
-                # 设置文本模式
+                # 设置文本模式 + UCS2 字符集
                 self.dev.write(EP_BULK_OUT, b'AT+CMGF=1\r', timeout=5000)
                 self._drain(timeout=2000)
-                self.dev.write(EP_BULK_OUT, b'AT+CSCS="GSM"\r', timeout=5000)
+                self.dev.write(EP_BULK_OUT, b'AT+CSCS="UCS2"\r', timeout=5000)
                 self._drain(timeout=2000)
 
-                # 发送 CMGS 命令
-                cmd = f'AT+CMGS="{phone}"\r'.encode('utf-8')
+                # 发送 CMGS 命令（号码用 UCS2 hex）
+                phone_ucs2 = self._ucs2_encode(phone)
+                cmd = f'AT+CMGS="{phone_ucs2}"\r'.encode('ascii')
                 self.dev.write(EP_BULK_OUT, cmd, timeout=5000)
                 time.sleep(0.5)
 
@@ -156,8 +174,8 @@ class ModemManager:
                 if b'>' not in prompt:
                     raise RuntimeError("未收到短信输入提示符 (>)")
 
-                # 发送消息内容 + Ctrl+Z
-                msg_data = message.encode('utf-8') + b'\x1a'
+                # 发送消息内容（UCS2 hex）+ Ctrl+Z
+                msg_data = self._ucs2_encode(message).encode('ascii') + b'\x1a'
                 self.dev.write(EP_BULK_OUT, msg_data, timeout=5000)
 
                 # 读取发送结果
@@ -197,10 +215,10 @@ class ModemManager:
             pass
 
     def list_sms(self, stat="ALL"):
-        """列出短信。"""
+        """列出短信（UCS2 编码，支持中文）。"""
         # 先设置文本模式和字符集
         self.send_at('AT+CMGF=1')
-        self.send_at('AT+CSCS="GSM"')
+        self.send_at('AT+CSCS="UCS2"')
         resp = self.send_at(f'AT+CMGL="{stat}"', timeout=10000)
         messages = []
         lines = resp.split('\n')
@@ -214,7 +232,8 @@ class ModemManager:
                     if i + 1 < len(lines):
                         content = lines[i + 1].strip()
                         i += 1
-                    parts['content'] = content
+                    parts['content'] = self._ucs2_decode(content)
+                    parts['sender'] = self._ucs2_decode(parts.get('sender', ''))
                     messages.append(parts)
             i += 1
         return messages
@@ -251,9 +270,9 @@ class ModemManager:
         return result
 
     def read_sms(self, index):
-        """读取指定索引的短信。"""
+        """读取指定索引的短信（UCS2 编码，支持中文）。"""
         self.send_at('AT+CMGF=1')
-        self.send_at('AT+CSCS="GSM"')
+        self.send_at('AT+CSCS="UCS2"')
         resp = self.send_at(f'AT+CMGR={index}', timeout=5000)
         lines = resp.split('\n')
         for i, line in enumerate(lines):
@@ -264,9 +283,9 @@ class ModemManager:
                 return {
                     'index': str(index),
                     'status': parts[0].strip().strip('"') if len(parts) > 0 else '',
-                    'sender': parts[1].strip().strip('"') if len(parts) > 1 else '',
+                    'sender': self._ucs2_decode(parts[1]) if len(parts) > 1 else '',
                     'timestamp': parts[3].strip().strip('"') if len(parts) > 3 else '',
-                    'content': content,
+                    'content': self._ucs2_decode(content),
                 }
         return None
 
@@ -294,6 +313,8 @@ class ModemManager:
             result['sim_status'] = self._clean(self.send_at('AT+CPIN?'))
             result['signal_quality'] = self._clean(self.send_at('AT+CSQ'))
             result['operator'] = self._clean(self.send_at('AT+COPS?'))
+            # CSCA 受当前字符集影响，切回 GSM 保证可读
+            self.send_at('AT+CSCS="GSM"')
             result['sms_center'] = self._clean(self.send_at('AT+CSCA?'))
 
             # 解析信号质量
@@ -465,245 +486,134 @@ class CallRecordStore:
             return True
 
 
-# ─── Network Speed Monitor ───────────────────────────────────────────
-class SpeedMonitor:
-    """监控 4G 模块网卡(en9)的实时上下行速率。"""
+# ─── Module Traffic Monitor (基于模块 AT+QGDCNT 真实蜂窝流量) ─────────
+class ModuleTrafficMonitor:
+    """通过模块内部 AT+QGDCNT 计数器统计真实 4G 流量。
 
-    def __init__(self, interface='en9'):
-        self.interface = interface
-        self._lock = threading.Lock()
-        self._last_bytes = None  # (bytes_sent, bytes_recv, timestamp)
-        self._history = []       # 保留最近 60 个采样点
-        self._max_history = 60
-
-    def _find_interface(self):
-        """自动查找 4G 模块的网卡接口名。"""
-        try:
-            stats = psutil.net_io_counters(pernic=True)
-            # 优先用 en9，找不到就找其他非 lo0/en0 的活跃接口
-            if self.interface in stats:
-                return self.interface
-            for name in stats:
-                if name.startswith('en') and name not in ('en0',) and int(stats[name].isup if hasattr(stats[name], 'isup') else True):
-                    return name
-        except Exception:
-            pass
-        return self.interface
-
-    def get_speed(self):
-        """返回当前上下行速率 (bytes/s) 及历史数据。"""
-        with self._lock:
-            iface = self._find_interface()
-            try:
-                stats = psutil.net_io_counters(pernic=True)
-                if iface not in stats:
-                    return {'ok': False, 'error': f'接口 {iface} 未找到', 'interface': iface}
-                now = time.time()
-                sent = stats[iface].bytes_sent
-                recv = stats[iface].bytes_recv
-                result = {
-                    'ok': True,
-                    'interface': iface,
-                    'timestamp': now,
-                }
-                if self._last_bytes is not None:
-                    prev_sent, prev_recv, prev_time = self._last_bytes
-                    dt = now - prev_time
-                    if dt > 0:
-                        upload_speed = max(0, (sent - prev_sent) / dt)
-                        download_speed = max(0, (recv - prev_recv) / dt)
-                        result['upload_speed'] = round(upload_speed, 1)
-                        result['download_speed'] = round(download_speed, 1)
-                        result['total_sent'] = sent
-                        result['total_recv'] = recv
-                        # 记录历史
-                        self._history.append({
-                            't': now,
-                            'up': round(upload_speed, 1),
-                            'down': round(download_speed, 1),
-                        })
-                        if len(self._history) > self._max_history:
-                            self._history.pop(0)
-                        result['history'] = list(self._history[-30:])
-                    else:
-                        result['upload_speed'] = 0
-                        result['download_speed'] = 0
-                else:
-                    result['upload_speed'] = 0
-                    result['download_speed'] = 0
-                    result['total_sent'] = sent
-                    result['total_recv'] = recv
-                self._last_bytes = (sent, recv, now)
-                return result
-            except Exception as e:
-                return {'ok': False, 'error': str(e), 'interface': iface}
-
-
-# ─── Data Usage Monitor (流量消耗统计) ────────────────────────────────
-class DataUsageMonitor:
-    """累计统计 4G 模块网卡(en9)的流量消耗，持久化到 data_usage.json。
-
-    处理接口重置(拔插模块后 bytes 计数归零)：检测到当前计数小于上次采样时，
-    先把当前接口生命周期内的量并入 accumulated，再以新计数为基线继续统计。
+    旧方案用 psutil 读 Mac 网卡计数——模块的 ECM 网卡只承载 AT/管理流量，
+    统计值恒为 0，毫无意义。QGDCNT 是基带层面的真实蜂窝收发字节，
+    与系统路由无关。
+    ⚠ 本固件(QDC507GLEFM21)实测 QGDCNT 返回「字节」而非官方文档标注的 KB
+    （若按 KB 解释，寿命累计会达数百 TB，不可能；按字节解释则与实际情况吻合），
+    因此读回后统一除以 1024 换算为 KB。
+    模块重启后计数器清零，靠 _last 采样对比自动衔接。
+    按天/按月的用量为「本应用开始跟踪以来」的增量，持久化到 JSON。
     """
 
-    def __init__(self, interface='en9', filepath=None):
-        self.interface = interface
+    def __init__(self, filepath=None):
         self.filepath = filepath or os.path.join(BASE_DIR, 'data_usage.json')
         self._lock = threading.Lock()
-        self._data = {
-            'start_ts': 0,
-            'accumulated_sent': 0,
-            'accumulated_recv': 0,
-            'baseline_sent': 0,
-            'baseline_recv': 0,
-            'last_sent': 0,
-            'last_recv': 0,
-            'daily': {},
-            'monthly': {},
-        }
+        self._last = None          # (rx_kb, tx_kb, ts)
+        self._history = []         # 最近 60 个采样点 {t, down, up} KB/s
+        self._today = {'date': time.strftime('%Y-%m-%d'), 'recv': 0.0, 'sent': 0.0}
+        self._month = {'month': time.strftime('%Y-%m'), 'recv': 0.0, 'sent': 0.0}
+        self._last_save = 0.0
+        self._last_resp = {'ok': False, 'error': '尚未采样'}
         self._load()
 
+    # ---- 持久化 ----
     def _load(self):
         try:
             with open(self.filepath, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                self._data.update(loaded)
+                d = json.load(f)
+            if d.get('today', {}).get('date') == self._today['date']:
+                self._today = d['today']
+            if d.get('month', {}).get('month') == self._month['month']:
+                self._month = d['month']
         except Exception:
             pass
 
     def _save(self):
         try:
             with open(self.filepath, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
+                json.dump({'today': self._today, 'month': self._month}, f)
         except Exception:
             pass
 
-    def _find_interface(self):
-        try:
-            stats = psutil.net_io_counters(pernic=True)
-            if self.interface in stats:
-                return self.interface
-            for name in stats:
-                if name.startswith('en') and name != 'en0':
-                    return name
-        except Exception:
-            pass
-        return self.interface
-
-    def _read_counters(self):
-        stats = psutil.net_io_counters(pernic=True)
-        iface = self._find_interface()
-        if iface not in stats:
-            return iface, None
-        return iface, (stats[iface].bytes_sent, stats[iface].bytes_recv)
+    # ---- 采样 ----
+    def _read_qgdcnt(self):
+        """返回 (rx_bytes, tx_bytes)，失败抛异常。固件返回的是字节。"""
+        resp = modem.send_at('AT+QGDCNT?', timeout=6000)
+        m = re.search(r'\+QGDCNT:\s*(\d+)\s*,\s*(\d+)', resp)
+        if not m:
+            raise RuntimeError(f'QGDCNT 响应异常: {resp[:80]}')
+        return int(m.group(1)), int(m.group(2))
 
     def tick(self):
-        """采样一次并累计流量，返回当前统计。"""
+        """采样一次，更新速率/日/月统计。"""
         with self._lock:
-            iface, counters = self._read_counters()
-            if counters is None:
-                return self._summary(iface, unavailable=True)
-            sent, recv = counters
-            now = time.time()
+            try:
+                if not modem.is_connected():
+                    self._last = None
+                    return
+                rxb, txb = self._read_qgdcnt()
+                rx, tx = rxb / 1024.0, txb / 1024.0   # 字节 → KB
+                now = time.time()
+                down = up = 0.0
+                if self._last is not None:
+                    last_rx, last_tx, last_ts = self._last
+                    dt = now - last_ts
+                    if dt > 0 and rx >= last_rx and tx >= last_tx:
+                        down = (rx - last_rx) / dt
+                        up = (tx - last_tx) / dt
+                        # 合理性钳制：单次采样不可能超过 200 Mbps(25600 KB/s)。
+                        # 模块初始化/重启瞬间可能返回跳变值，直接丢弃本次增量。
+                        if down > 25600 or up > 25600:
+                            down = up = 0.0
+                        else:
+                            # 计入日/月增量
+                            today = time.strftime('%Y-%m-%d')
+                            month = time.strftime('%Y-%m')
+                            if self._today['date'] != today:
+                                self._today = {'date': today, 'recv': 0.0, 'sent': 0.0}
+                            if self._month['month'] != month:
+                                self._month = {'month': month, 'recv': 0.0, 'sent': 0.0}
+                            self._today['recv'] += rx - last_rx
+                            self._today['sent'] += tx - last_tx
+                            self._month['recv'] += rx - last_rx
+                            self._month['sent'] += tx - last_tx
+                        self._history.append({'t': now, 'down': round(down, 1), 'up': round(up, 1)})
+                        if len(self._history) > 60:
+                            self._history.pop(0)
+                self._last = (rx, tx, now)
+                self._last_resp = {
+                    'ok': True,
+                    'source': 'qgdcnt',
+                    'down': round(down, 1),   # KB/s
+                    'up': round(up, 1),
+                    'rx_total_kb': rx,        # 模块生命周期累计
+                    'tx_total_kb': tx,
+                    'today': {'recv_kb': round(self._today['recv'], 1), 'sent_kb': round(self._today['sent'], 1)},
+                    'month': {'recv_kb': round(self._month['recv'], 1), 'sent_kb': round(self._month['sent'], 1)},
+                    'history': list(self._history[-60:]),
+                    'timestamp': now,
+                }
+                if now - self._last_save > 30:
+                    self._save()
+                    self._last_save = now
+            except Exception as e:
+                self._last_resp = {'ok': False, 'error': str(e), 'source': 'qgdcnt'}
 
-            if self._data['start_ts'] == 0:
-                self._data['start_ts'] = now
-                self._data['baseline_sent'] = sent
-                self._data['baseline_recv'] = recv
-                self._data['last_sent'] = sent
-                self._data['last_recv'] = recv
-                self._save()
-                return self._summary(iface)
-
-            # 接口重置：当前计数小于上次采样，说明 bytes 归零
-            if sent < self._data['last_sent'] or recv < self._data['last_recv']:
-                self._data['accumulated_sent'] += max(0, self._data['last_sent'] - self._data['baseline_sent'])
-                self._data['accumulated_recv'] += max(0, self._data['last_recv'] - self._data['baseline_recv'])
-                self._data['baseline_sent'] = sent
-                self._data['baseline_recv'] = recv
-
-            inc_sent = max(0, sent - self._data['last_sent'])
-            inc_recv = max(0, recv - self._data['last_recv'])
-
-            if inc_sent or inc_recv:
-                day = time.strftime('%Y-%m-%d')
-                month = time.strftime('%Y-%m')
-                d = self._data['daily'].setdefault(day, {'sent': 0, 'recv': 0})
-                d['sent'] += inc_sent
-                d['recv'] += inc_recv
-                m = self._data['monthly'].setdefault(month, {'sent': 0, 'recv': 0})
-                m['sent'] += inc_sent
-                m['recv'] += inc_recv
-
-            self._data['last_sent'] = sent
-            self._data['last_recv'] = recv
-            self._save()
-            return self._summary(iface)
-
-    def _summary(self, iface, unavailable=False):
-        cur_sent = max(0, self._data['last_sent'] - self._data['baseline_sent'])
-        cur_recv = max(0, self._data['last_recv'] - self._data['baseline_recv'])
-        total_sent = self._data['accumulated_sent'] + cur_sent
-        total_recv = self._data['accumulated_recv'] + cur_recv
-        day = time.strftime('%Y-%m-%d')
-        month = time.strftime('%Y-%m')
-        today = self._data['daily'].get(day, {'sent': 0, 'recv': 0})
-        this_month = self._data['monthly'].get(month, {'sent': 0, 'recv': 0})
-        return {
-            'ok': not unavailable,
-            'interface': iface,
-            'unavailable': unavailable,
-            'total_sent': total_sent,
-            'total_recv': total_recv,
-            'total': total_sent + total_recv,
-            'today_sent': today['sent'],
-            'today_recv': today['recv'],
-            'today_total': today['sent'] + today['recv'],
-            'month_sent': this_month['sent'],
-            'month_recv': this_month['recv'],
-            'month_total': this_month['sent'] + this_month['recv'],
-            'start_ts': self._data['start_ts'],
-            'daily': dict(self._data['daily']),
-        }
+    def get_speed(self):
+        return dict(self._last_resp)
 
     def get_summary(self):
-        with self._lock:
-            iface, counters = self._read_counters()
-            if counters is None:
-                return self._summary(iface, unavailable=True)
-            sent, recv = counters
-            # 计算当前实时总量（不写盘，只读）
-            cur_sent = max(0, sent - self._data['baseline_sent'])
-            cur_recv = max(0, recv - self._data['baseline_recv'])
-            total_sent = self._data['accumulated_sent'] + cur_sent
-            total_recv = self._data['accumulated_recv'] + cur_recv
-            summary = self._summary(iface)
-            summary['total_sent'] = total_sent
-            summary['total_recv'] = total_recv
-            summary['total'] = total_sent + total_recv
-            return summary
+        return dict(self._last_resp)
 
     def reset(self):
-        """清零所有统计，以当前计数为新基线。"""
+        """清零模块计数器 + 本应用日/月统计。"""
         with self._lock:
-            iface, counters = self._read_counters()
-            sent = recv = 0
-            if counters is not None:
-                sent, recv = counters
-            self._data.update({
-                'start_ts': time.time(),
-                'accumulated_sent': 0,
-                'accumulated_recv': 0,
-                'baseline_sent': sent,
-                'baseline_recv': recv,
-                'last_sent': sent,
-                'last_recv': recv,
-                'daily': {},
-                'monthly': {},
-            })
+            try:
+                modem.send_at('AT+QGDCNT=0,0', timeout=6000)
+            except Exception:
+                pass
+            self._last = None
+            self._history = []
+            self._today = {'date': time.strftime('%Y-%m-%d'), 'recv': 0.0, 'sent': 0.0}
+            self._month = {'month': time.strftime('%Y-%m'), 'recv': 0.0, 'sent': 0.0}
             self._save()
-            return self._summary(iface, unavailable=counters is None)
+            return {'ok': True}
+
 
 
 # ─── Call Manager (通话状态管理) ─────────────────────────────────────
@@ -727,6 +637,7 @@ class CallManager:
         self._last_call_record = None  # 缓存上一次通话信息用于记录
         self._call_recorded = False    # 当前通话是否已记录(防止重复/漏记)
         self._hungup_number = ''       # 刚挂断的号码,用于过滤模块固件残留状态
+        self._voice_prepared = False   # 本通电话是否已触发模块侧语音路由
 
     def start(self):
         if self._running:
@@ -808,6 +719,7 @@ class CallManager:
                     self._state = 'active'
                     if self._call_start is None:
                         self._call_start = time.time()
+                    self._ensure_voice_for_call()
                 else:
                     self._state = c['state']
             elif has_ring:
@@ -827,6 +739,36 @@ class CallManager:
                 self._number = ''
                 self._direction = ''
                 self._hungup_number = ''  # 模组确认无通话,清除标记
+                self._teardown_voice()
+
+    # ---- 模块侧语音路由（voice_runtime）通话期钩子 ----
+    def _ensure_voice_for_call(self):
+        """通话进入 active 时后台准备模块侧语音路由（幂等）。"""
+        if self._voice_prepared:
+            return
+        self._voice_prepared = True
+
+        def _prep():
+            try:
+                voice_runtime.ensure_voice_route()
+            except Exception as e:
+                # 失败则复位标记，下次通话状态变化时重试
+                self._voice_prepared = False
+                print(f'语音路由准备失败: {e}', file=sys.stderr)
+        threading.Thread(target=_prep, daemon=True).start()
+
+    def _teardown_voice(self):
+        """通话结束后拆除语音路由。"""
+        if not self._voice_prepared:
+            return
+        self._voice_prepared = False
+
+        def _stop():
+            try:
+                voice_runtime.stop_voice_route()
+            except Exception as e:
+                print(f'语音路由停止失败: {e}', file=sys.stderr)
+        threading.Thread(target=_stop, daemon=True).start()
 
     def get_status(self):
         with self._lock:
@@ -860,6 +802,7 @@ class CallManager:
                 self._call_recorded = False
                 self._hungup_number = ''
                 self._last_call_record = None
+            self._ensure_voice_for_call()  # 拨号同时后台准备语音路由
             try:
                 resp = self.modem.send_at(f'ATD{number};', timeout=10000)
                 ok = 'OK' in resp
@@ -872,7 +815,25 @@ class CallManager:
                     if not ok:
                         self._record_call_end()
                         self._reset_state_locked()
+            if ok:
+                self._init_audio()
             return ok
+
+    def _init_audio(self):
+        """通话建立时初始化模组音频：音量、解除静音、麦克风增益（读设置）。"""
+        try:
+            vol = settings.get_all().get('call_volume', 5)
+        except Exception:
+            vol = 5
+        try:
+            mic = settings.get_all().get('mic_gain', 12)
+        except Exception:
+            mic = 12
+        for cmd in (f'AT+CLVL={vol}', 'AT+QMUTE=0', f'AT+QMIC=1,{mic}'):
+            try:
+                self.modem.send_at(cmd, timeout=2000)
+            except Exception:
+                pass
 
     def answer(self):
         with self._action_lock:
@@ -884,6 +845,7 @@ class CallManager:
                     self._call_start = time.time()
                     self._call_recorded = False
                     self._hungup_number = ''
+                self._init_audio()
             return ok
 
     def hangup(self):
@@ -979,23 +941,41 @@ class CallManager:
 # ─── Flask App ───────────────────────────────────────────────────────
 app = Flask(__name__, static_folder=None)
 modem = ModemManager()
-speed_monitor = SpeedMonitor()
-data_usage = DataUsageMonitor()
-sent_store = SentMessageStore(os.path.join(BASE_DIR, 'sent_sms.json'))
-call_store = CallRecordStore(os.path.join(BASE_DIR, 'call_history.json'))
+traffic = ModuleTrafficMonitor()
+def _persistent_data_path(filename):
+    """数据文件（设置/发件箱/通话记录）持久化到用户目录，避免 App 重建时丢失。"""
+    base = os.path.expanduser('~/Library/Application Support/DJiPhoneKit')
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        return os.path.join(BASE_DIR, filename)
+    new_path = os.path.join(base, filename)
+    legacy = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(new_path) and os.path.exists(legacy):
+        try:
+            import shutil
+            shutil.copy2(legacy, new_path)
+        except Exception:
+            pass
+    return new_path
+
+
+sent_store = SentMessageStore(_persistent_data_path('sent_sms.json'))
+call_store = CallRecordStore(_persistent_data_path('call_history.json'))
 call_manager = CallManager(modem, call_store=call_store)
 if os.environ.get('SMS_HUB_DISABLE_BACKGROUND') != '1':
     call_manager.start()
 
 
 def _data_usage_loop():
-    """后台线程，每 5 秒采样一次流量，保证按天/按月归类准确。"""
+    """后台线程，每 2 秒读一次模块 QGDCNT 计数器。"""
+    time.sleep(4)  # 等模块连接就绪
     while True:
         try:
-            data_usage.tick()
+            traffic.tick()
         except Exception:
             pass
-        time.sleep(5)
+        time.sleep(2)
 
 
 _data_usage_thread = threading.Thread(target=_data_usage_loop, daemon=True)
@@ -1005,6 +985,23 @@ _data_usage_thread.start()
 @app.route('/')
 def index():
     return send_file(os.path.join(BASE_DIR, 'index.html'))
+
+
+@app.route('/m')
+@app.route('/m/')
+def mobile():
+    return send_file(os.path.join(BASE_DIR, 'mobile.html'))
+
+
+@app.route('/manifest.webmanifest')
+def webmanifest():
+    return send_file(os.path.join(BASE_DIR, 'manifest.webmanifest'),
+                     mimetype='application/manifest+json')
+
+
+@app.route('/app-icon.png')
+def app_icon_png():
+    return send_file(os.path.join(BASE_DIR, 'assets', 'icon.png'), mimetype='image/png')
 
 
 @app.route('/api/status')
@@ -1100,7 +1097,7 @@ def api_delete_all():
 @app.route('/api/speed')
 def api_speed():
     try:
-        return jsonify(speed_monitor.get_speed())
+        return jsonify(traffic.get_speed())
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -1108,7 +1105,7 @@ def api_speed():
 @app.route('/api/data-usage')
 def api_data_usage():
     try:
-        return jsonify(data_usage.get_summary())
+        return jsonify(traffic.get_summary())
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -1116,9 +1113,693 @@ def api_data_usage():
 @app.route('/api/data-usage/reset', methods=['POST'])
 def api_data_usage_reset():
     try:
-        return jsonify(data_usage.reset())
+        return jsonify(traffic.reset())
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+# ─── Settings Store (应用设置持久化) ─────────────────────────────────
+LAUNCH_AGENT_LABEL = 'local.idoer.djiphone'
+LAUNCH_AGENT_LEGACY_LABELS = ('local.idoer.sms-hub',)
+LAUNCH_AGENT_PATH = os.path.expanduser(f'~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist')
+APP_BUNDLE_PATH = os.path.expanduser('~/Applications/DJiPhone Kit.app')
+APP_BUNDLE_LEGACY_PATHS = (os.path.expanduser('~/Applications/DjiPhone.app'),)
+
+DEFAULT_SETTINGS = {
+    'autostart': True,        # 开机自启（LaunchAgent）
+    'lan_pin': '',            # 局域网访问 PIN（空=不启用鉴权）
+    'call_volume': 5,         # 通话听筒音量 0-5
+    'mic_gain': 12,           # 麦克风增益
+    'notify_new_sms': True,   # 新短信通知（前端轮询提示）
+    'sms_forward': {          # 短信转发（参考 CellDock）
+        'enabled': False,
+        'bark_url': '',        # 例: https://api.day.app/你的Key
+        'feishu_webhook': '',  # 飞书自定义机器人 webhook
+        'feishu_secret': '',   # 飞书加签密钥（可选）
+        'dingtalk_webhook': '',  # 钉钉自定义机器人 webhook
+        'dingtalk_secret': '',   # 钉钉加签密钥（可选）
+    },
+}
+
+
+class SettingsStore:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self._lock = threading.Lock()
+        self._data = dict(DEFAULT_SETTINGS)
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    for k in DEFAULT_SETTINGS:
+                        if k not in saved:
+                            continue
+                        # 嵌套设置（如 sms_forward）做字段级合并，保留新增字段的默认值
+                        if isinstance(DEFAULT_SETTINGS[k], dict) and isinstance(saved[k], dict):
+                            merged = dict(DEFAULT_SETTINGS[k])
+                            merged.update({sk: sv for sk, sv in saved[k].items() if sk in DEFAULT_SETTINGS[k]})
+                            self._data[k] = merged
+                        else:
+                            self._data[k] = saved[k]
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            with open(self.filepath, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def get_all(self):
+        with self._lock:
+            return dict(self._data)
+
+    def set_many(self, updates):
+        with self._lock:
+            for k, v in updates.items():
+                if k not in DEFAULT_SETTINGS:
+                    continue
+                if isinstance(DEFAULT_SETTINGS[k], dict) and isinstance(v, dict):
+                    merged = dict(self._data[k])
+                    merged.update({sk: sv for sk, sv in v.items() if sk in DEFAULT_SETTINGS[k]})
+                    self._data[k] = merged
+                else:
+                    self._data[k] = v
+            self._save()
+            return dict(self._data)
+
+
+def _write_launch_agent(enabled):
+    """启用/禁用开机自启（LaunchAgent plist）。同时清理历史遗留的旧标签。"""
+    try:
+        for legacy in LAUNCH_AGENT_LEGACY_LABELS:
+            legacy_path = os.path.expanduser(f'~/Library/LaunchAgents/{legacy}.plist')
+            try:
+                os.unlink(legacy_path)
+            except FileNotFoundError:
+                pass
+        for legacy_app in APP_BUNDLE_LEGACY_PATHS:
+            if os.path.isdir(legacy_app):
+                import shutil
+                try:
+                    shutil.rmtree(legacy_app)
+                except Exception:
+                    pass
+        if enabled:
+            # 优先指向已安装的 App，否则用仓库里的 app.py
+            if os.path.isdir(APP_BUNDLE_PATH):
+                exe = os.path.join(APP_BUNDLE_PATH, 'Contents/MacOS/DJiPhone Kit')
+            else:
+                exe = os.path.join(BASE_DIR, 'app.py')
+            python_bin = os.path.expanduser('~/.workbuddy/binaries/python/envs/default/bin/python3')
+            if exe.endswith('.py') and os.path.exists(python_bin):
+                program_args = [python_bin, exe]
+            else:
+                program_args = [exe]
+            plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>{''.join(f'<string>{a}</string>' for a in program_args)}</array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+</dict>
+</plist>
+'''
+            os.makedirs(os.path.dirname(LAUNCH_AGENT_PATH), exist_ok=True)
+            with open(LAUNCH_AGENT_PATH, 'w', encoding='utf-8') as f:
+                f.write(plist)
+        else:
+            try:
+                os.unlink(LAUNCH_AGENT_PATH)
+            except FileNotFoundError:
+                pass
+        return True
+    except Exception as e:
+        print(f'LaunchAgent 操作失败: {e}', file=sys.stderr)
+        return False
+
+
+settings = SettingsStore(_persistent_data_path('settings.json'))
+
+# ─── LAN 局域网访问 ──────────────────────────────────────────────────
+import socket
+import base64
+
+def _get_lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(('223.5.5.5', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return '127.0.0.1'
+
+# 局域网 PIN 鉴权：页面/静态资源免 token，API 需 token（query/header/cookie）
+LOCAL_ADDRS = {'127.0.0.1', '::1', 'localhost'}
+PUBLIC_PATHS = ('/', '/m', '/m/', '/index.html', '/mobile.html',
+                '/manifest.webmanifest', '/app-icon.png', '/favicon.ico',
+                '/api/lan', '/api/pin-login')
+
+
+@app.before_request
+def _lan_auth():
+    if request.remote_addr in LOCAL_ADDRS:
+        return None
+    if request.path in PUBLIC_PATHS:
+        return None
+    pin = settings.get_all().get('lan_pin', '')
+    if not pin:
+        return None
+    token = (request.args.get('token') or request.headers.get('X-Auth-Token')
+             or request.cookies.get('dj_token') or '')
+    if token == pin:
+        return None
+    if request.path.startswith('/api/'):
+        return jsonify({'ok': False, 'error': '需要访问 PIN', 'need_pin': True}), 401
+    return jsonify({'ok': False, 'error': '需要访问 PIN', 'need_pin': True}), 401
+
+
+@app.route('/api/pin-login', methods=['POST'])
+def api_pin_login():
+    data = request.get_json(force=True) or {}
+    pin = (data.get('pin') or '').strip()
+    real = settings.get_all().get('lan_pin', '')
+    if not real:
+        return jsonify({'ok': True, 'need_pin': False})
+    if pin == real:
+        resp = jsonify({'ok': True})
+        resp.set_cookie('dj_token', pin, max_age=30 * 86400, httponly=True,
+                        samesite='Lax')
+        return resp
+    return jsonify({'ok': False, 'error': 'PIN 不正确'}), 401
+
+
+@app.route('/api/lan')
+def api_lan():
+    ip = _get_lan_ip()
+    pin = settings.get_all().get('lan_pin', '')
+    url = f'http://{ip}:8080' + (f'/?token={pin}' if pin else '')
+    qr = ''
+    try:
+        import qrcode
+        import io
+        img = qrcode.make(url)
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        qr = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'ip': ip, 'port': 8080, 'url': url, 'qr': qr, 'pin_enabled': bool(pin)})
+
+
+# ─── Contacts 通讯录 ─────────────────────────────────────────────────
+_contacts_cache = {'ts': 0.0, 'data': [], 'error': None}
+CONTACTS_TTL = 300  # 秒
+
+
+def _fetch_contacts_macos():
+    """通过 pyobjc Contacts 框架读取 Mac 通讯录。首次调用触发系统授权弹窗。"""
+    import Contacts as C
+    import threading as _th
+
+    store = C.CNContactStore.alloc().init()
+    ev = _th.Event()
+    granted = {'v': False, 'err': None}
+
+    def _access_done(g, error):
+        granted['v'] = bool(g)
+        if error is not None:
+            try:
+                granted['err'] = error.localizedDescription()
+            except Exception:
+                pass
+        ev.set()
+
+    store.requestAccessForEntityType_completionHandler_(C.CNEntityTypeContacts, _access_done)
+    if not ev.wait(timeout=30):
+        raise RuntimeError('通讯录授权超时，请在 系统设置→隐私与安全性→通讯录 中允许本应用')
+    if not granted['v']:
+        raise RuntimeError('通讯录访问被拒绝：请在 系统设置→隐私与安全性→通讯录 中允许本应用')
+
+    keys = [C.CNContactGivenNameKey, C.CNContactFamilyNameKey,
+            C.CNContactNicknameKey, C.CNContactPhoneNumbersKey,
+            C.CNContactOrganizationNameKey]
+    req = C.CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
+    found = []
+
+    def _each(contact, stop):
+        name = ' '.join(x for x in (contact.familyName(), contact.givenName()) if x).strip()
+        if not name:
+            name = contact.nickname() or contact.organizationName() or '无名联系人'
+        phones = []
+        for lv in contact.phoneNumbers():
+            try:
+                num = lv.value().stringValue()
+                if num:
+                    phones.append(num.replace(' ', '').replace('-', ''))
+            except Exception:
+                pass
+        if phones:
+            found.append({'name': name, 'phones': phones})
+        return True
+
+    ok = store.enumerateContactsWithFetchRequest_error_usingBlock_(req, None, _each)
+    if not ok:
+        raise RuntimeError('通讯录读取失败（可能未授权）')
+    found.sort(key=lambda c: c['name'])
+    return found
+
+
+@app.route('/api/contacts')
+def api_contacts():
+    query = (request.args.get('query') or '').strip().lower()
+    now = time.time()
+    if _contacts_cache['data'] or _contacts_cache['error']:
+        if now - _contacts_cache['ts'] > CONTACTS_TTL:
+            _contacts_cache.update({'ts': 0, 'data': [], 'error': None})
+    if not _contacts_cache['data'] and not _contacts_cache['error']:
+        try:
+            data = _fetch_contacts_macos()
+            _contacts_cache.update({'ts': now, 'data': data, 'error': None})
+        except ImportError:
+            err = '服务器缺少 Contacts 支持'
+            _contacts_cache.update({'ts': now, 'data': [], 'error': err})
+            return jsonify({'ok': False, 'error': err}), 501
+        except Exception as e:
+            err = str(e)
+            _contacts_cache.update({'ts': now, 'data': [], 'error': err})
+            return jsonify({'ok': False, 'error': err}), 403
+
+    if _contacts_cache['error']:
+        return jsonify({'ok': False, 'error': _contacts_cache['error']}), 403
+
+    data = _contacts_cache['data']
+    if query:
+        def _match(c):
+            if query in c['name'].lower():
+                return True
+            return any(query in p.lower() for p in c['phones'])
+        data = [c for c in data if _match(c)]
+    return jsonify({'ok': True, 'contacts': data[:200], 'total': len(data)})
+
+
+# ─── Call 音频控制 ───────────────────────────────────────────────────
+@app.route('/api/call/volume', methods=['POST'])
+def api_call_volume():
+    data = request.get_json(force=True)
+    try:
+        level = max(0, min(5, int(data.get('level', 5))))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': '音量需为 0-5'}), 400
+    mic = data.get('mic_gain')
+    updates = {'call_volume': level}
+    if mic is not None:
+        try:
+            updates['mic_gain'] = max(0, min(15, int(mic)))
+        except (TypeError, ValueError):
+            pass
+    settings.set_many(updates)
+    results = {}
+    try:
+        results['clvl'] = modem.send_at(f'AT+CLVL={level}', timeout=3000)
+        results['qmic'] = modem.send_at(
+            f"AT+QMIC=1,{settings.get_all()['mic_gain']}", timeout=3000)
+        results['mute'] = modem.send_at('AT+QMUTE=0', timeout=3000)
+        return jsonify({'ok': True, 'results': results})
+    except RuntimeError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 503
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+# ─── Settings API ────────────────────────────────────────────────────
+@app.route('/api/settings', methods=['GET'])
+def api_settings_get():
+    data = settings.get_all()
+    data['autostart_installed'] = os.path.exists(LAUNCH_AGENT_PATH)
+    return jsonify({'ok': True, 'settings': data})
+
+
+@app.route('/api/settings', methods=['POST'])
+def api_settings_set():
+    data = request.get_json(force=True) or {}
+    updates = {}
+    for k in DEFAULT_SETTINGS:
+        if k in data:
+            updates[k] = data[k]
+    if not updates:
+        return jsonify({'ok': False, 'error': '没有可更新的设置项'}), 400
+    saved = settings.set_many(updates)
+    if 'autostart' in updates:
+        saved['autostart_installed'] = _write_launch_agent(bool(updates['autostart']))
+    else:
+        saved['autostart_installed'] = os.path.exists(LAUNCH_AGENT_PATH)
+    return jsonify({'ok': True, 'settings': saved})
+
+
+# ─── Voice 语音诊断/修复（参考 dji-4g-connect 的 IMS+UAC 配方）────────
+def _parse_usbcfg_flags(resp):
+    """从 AT+QCFG="usbcfg" 响应解析 9 个字段（vid,pid + 7 个开关位）。"""
+    import re
+    m = re.search(r'\+QCFG:\s*"usbcfg",\s*(0x[0-9A-Fa-f]+|\d+),(0x[0-9A-Fa-f]+|\d+),([01]),([01]),([01]),([01]),([01]),([01]),([01])', resp)
+    if not m:
+        return None
+    return [m.group(i).strip() for i in range(1, 10)]
+
+
+def _voice_diag():
+    """采集模块语音链路配置，返回诊断结果。"""
+    import re
+    diag = {}
+    try:
+        diag['ims'] = modem.send_at('AT+QCFG="ims"', timeout=5000)
+    except Exception as e:
+        diag['ims'] = f'<ERROR {e.__class__.__name__}>'
+    try:
+        diag['usbcfg'] = modem.send_at('AT+QCFG="usbcfg"', timeout=5000)
+    except Exception as e:
+        diag['usbcfg'] = f'<ERROR {e.__class__.__name__}>'
+    try:
+        diag['qpcmv'] = modem.send_at('AT+QPCMV?', timeout=3000)
+    except Exception as e:
+        diag['qpcmv'] = f'<ERROR {e.__class__.__name__}>'
+    try:
+        diag['ceer'] = modem.send_at('AT+CEER', timeout=3000)
+    except Exception:
+        diag['ceer'] = ''
+    try:
+        diag['cereg'] = modem.send_at('AT+CEREG?', timeout=3000)
+    except Exception:
+        diag['cereg'] = ''
+
+    ims_ok = bool(re.search(r'\+QCFG:\s*"ims",\s*1(?:\s|,|$)', diag['ims']))
+    flags = _parse_usbcfg_flags(diag['usbcfg'])
+    # usbcfg 末两位: [音频接口, voice/audio 组合位]（dji-4g-connect 实测应均为 1）
+    uac_ok = bool(flags) and flags[-2] == '1' and flags[-1] == '1'
+    pcm_ok = ('+QPCMV' in diag['qpcmv']) and ('OK' in diag['qpcmv']) and ('ERROR' not in diag['qpcmv'])
+    # VoLTE 注册: CEREG 带 [4]/[5]（含 IMS 注册指示位）或直接看网络
+    volte_reg = bool(re.search(r'\+CEREG:\s*\d+,(\d+)[^,]*(?:,[^,]*){2},\d', diag['cereg']))
+    return {
+        'ims_enabled': ims_ok,
+        'uac_ok': uac_ok,
+        'usbcfg_flags': flags,
+        'pcm_ok': pcm_ok,
+        'raw': diag,
+        # pcm_ok=False 时固件无法把通话媒体路由到 USB 音频（需模块侧运行时，见 PROCESS.md）
+        'verdict': ('ready' if (ims_ok and uac_ok and pcm_ok)
+                    else 'partial' if (ims_ok and uac_ok)
+                    else 'needs_fix'),
+        'detail': f'IMS {"开" if ims_ok else "关"} · USB音频 {"OK" if uac_ok else "缺位"} · PCM路由 {"OK" if pcm_ok else "不支持/未配置"}',
+    }
+
+
+@app.route('/api/voice/diag')
+def api_voice_diag():
+    try:
+        if not modem.is_connected():
+            return jsonify({'ok': False, 'error': '模块未连接'}), 503
+        diag = _voice_diag()
+        # 附带 USB 接口清单（诊断 ADB/音频接口是否存在）
+        try:
+            import usb.core
+            dev = usb.core.find(idVendor=0x2CA3, idProduct=0x4006)
+            ifaces = []
+            if dev is not None:
+                for intf in dev.get_active_configuration():
+                    try:
+                        ifaces.append({'num': intf.bInterfaceNumber,
+                                       'class': intf.bInterfaceClass,
+                                       'subclass': intf.bInterfaceSubClass,
+                                       'proto': intf.bInterfaceProtocol})
+                    except AttributeError:
+                        pass
+            diag['usb_interfaces'] = ifaces
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'diag': diag})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/at', methods=['POST'])
+def api_at_debug():
+    """AT 调试通道：直接向模块发送一条 AT 指令（仅本机/带 PIN 的局域网可访问）。"""
+    data = request.get_json(force=True) or {}
+    cmd = (data.get('command') or data.get('cmd') or '').strip()
+    if not cmd:
+        return jsonify({'ok': False, 'error': 'command 不能为空'}), 400
+    if len(cmd) > 200 or '\n' in cmd or '\r' in cmd:
+        return jsonify({'ok': False, 'error': '指令格式无效'}), 400
+    try:
+        if not modem.is_connected():
+            return jsonify({'ok': False, 'error': '模块未连接'}), 503
+        resp = modem.send_at(cmd, timeout=8000)
+        return jsonify({'ok': True, 'response': resp.replace('\r', '').strip()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/gps')
+def api_gps():
+    """GPS 状态与定位。"""
+    try:
+        if not modem.is_connected():
+            return jsonify({'ok': False, 'error': '模块未连接'}), 503
+        state = modem.send_at('AT+QGPS?', timeout=4000)
+        on = '+QGPS: 1' in state
+        result = {'ok': True, 'on': on, 'lat': None, 'lon': None, 'fix': None,
+                  'satellites': None, 'altitude': None, 'speed': None, 'time': None}
+        if on:
+            loc = modem.send_at('AT+QGPSLOC?', timeout=6000)
+            if '+QGPSLOC:' in loc:
+                try:
+                    parts = loc.split('+QGPSLOC:')[1].strip().split(',')
+                    # utc,lat,lon,hdop,alt,fix,cog,spk km,spk kn,date,nsat
+                    result['time'] = parts[0].strip()
+                    result['lat'] = float(parts[1])
+                    result['lon'] = float(parts[2])
+                    result['altitude'] = float(parts[4])
+                    result['fix'] = int(parts[5])
+                    result['speed'] = float(parts[7])
+                    result['satellites'] = int(parts[10])
+                except (ValueError, IndexError):
+                    result['loc_error'] = '尚未定位成功（户外空旷处需 1-2 分钟）'
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/gps/power', methods=['POST'])
+def api_gps_power():
+    """GPS 电源开关。"""
+    data = request.get_json(force=True) or {}
+    on = bool(data.get('on'))
+    try:
+        if not modem.is_connected():
+            return jsonify({'ok': False, 'error': '模块未连接'}), 503
+        resp = modem.send_at(f'AT+QGPS={"1" if on else "0"}', timeout=8000)
+        ok = 'OK' in resp
+        return jsonify({'ok': ok, 'on': on, 'response': resp.strip()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/voice/apply', methods=['POST'])
+def api_voice_apply():
+    """一键应用语音配置：usbcfg 末两位=1,1 + 开启 IMS + 保存 + 重启模组。"""
+    steps = []
+    try:
+        if not modem.is_connected():
+            return jsonify({'ok': False, 'error': '模块未连接'}), 503
+        resp = modem.send_at('AT+QCFG="usbcfg"', timeout=5000)
+        flags = _parse_usbcfg_flags(resp)
+        if not flags:
+            return jsonify({'ok': False, 'error': f'无法解析 usbcfg: {resp}'}), 500
+        target = flags[:7] + ['1', '1']
+        cmd = 'AT+QCFG="usbcfg",' + ','.join(target)
+        steps.append({'cmd': cmd, 'resp': modem.send_at(cmd, timeout=5000)})
+        steps.append({'cmd': 'AT+QCFG="ims",1', 'resp': modem.send_at('AT+QCFG="ims",1', timeout=5000)})
+        steps.append({'cmd': 'AT&W', 'resp': modem.send_at('AT&W', timeout=5000)})
+        try:
+            steps.append({'cmd': 'AT+CFUN=1,1', 'resp': modem.send_at('AT+CFUN=1,1', timeout=8000)})
+        except Exception as e:
+            steps.append({'cmd': 'AT+CFUN=1,1', 'resp': f'模组重启中（{e.__class__.__name__}，属预期）'})
+        return jsonify({'ok': True, 'steps': steps, 'note': '模组正在重启，约 30-60 秒后重新连接，届时请再次运行诊断'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), 'steps': steps}), 500
+
+
+# ─── SMS Forwarder 短信转发（参考 CellDock）──────────────────────────
+import hashlib
+import hmac as _hmac
+import time as _time
+import urllib.request as _urlreq
+
+_forward_state = {
+    'seen': {},      # id -> content hash，启动后首 seen 只记录不转发
+    'primed': False,
+}
+
+
+def _sign_secret(secret, ts):
+    """飞书/钉钉加签。"""
+    string_to_sign = f'{ts}\n{secret}'
+    import base64
+    hmac_code = _hmac.new(secret.encode(), string_to_sign.encode(), hashlib.sha256).digest()
+    return base64.b64encode(hmac_code).decode()
+
+
+def _http_post_json(url, payload, timeout=10):
+    req = _urlreq.Request(url, data=json.dumps(payload).encode('utf-8'),
+                          headers={'Content-Type': 'application/json'})
+    with _urlreq.urlopen(req, timeout=timeout) as r:
+        body = r.read().decode('utf-8', errors='replace')
+        return r.status, body
+
+
+def _forward_bark(cfg, sender, content):
+    base = (cfg.get('bark_url') or '').rstrip('/')
+    if not base:
+        return False, '未配置 bark_url'
+    from urllib.parse import quote
+    title = quote(f'短信来自 {sender}')
+    body = quote(content[:500])
+    url = f'{base}/{title}/{body}'
+    with _urlreq.urlopen(url, timeout=10) as r:
+        return r.status == 200, f'HTTP {r.status}'
+
+
+def _forward_feishu(cfg, sender, content):
+    url = cfg.get('feishu_webhook') or ''
+    if not url:
+        return False, '未配置 feishu_webhook'
+    secret = cfg.get('feishu_secret') or ''
+    payload = {'msg_type': 'text', 'content': {'text': f'📩 {sender}\n{content}'}}
+    if secret:
+        payload['timestamp'] = str(int(_time.time()))
+        payload['sign'] = _sign_secret(secret, int(_time.time()))
+    status, body = _http_post_json(url, payload)
+    ok = status == 200 and ('StatusCode' not in body or '0' in body[:60])
+    return ok, f'HTTP {status}: {body[:80]}'
+
+
+def _forward_dingtalk(cfg, sender, content):
+    url = cfg.get('dingtalk_webhook') or ''
+    if not url:
+        return False, '未配置 dingtalk_webhook'
+    secret = cfg.get('dingtalk_secret') or ''
+    if secret:
+        from urllib.parse import quote
+        ts = str(round(_time.time() * 1000))
+        sign = _sign_secret(secret, int(ts))
+        url += f'&timestamp={ts}&sign={quote(sign)}'
+    payload = {'msgtype': 'text', 'text': {'content': f'📩 {sender}\n{content}'}}
+    status, body = _http_post_json(url, payload)
+    ok = status == 200 and '"errcode":0' in body.replace(' ', '')
+    return ok, f'HTTP {status}: {body[:80]}'
+
+
+def _forward_one_sms(sender, content, timestamp=''):
+    cfg = settings.get_all().get('sms_forward') or {}
+    results = {}
+    if not cfg.get('enabled'):
+        return {'skipped': '转发未启用'}
+    for name, fn in (('bark', _forward_bark), ('feishu', _forward_feishu), ('dingtalk', _forward_dingtalk)):
+        try:
+            ok, detail = fn(cfg, sender, content)
+            results[name] = {'ok': ok, 'detail': detail}
+        except Exception as e:
+            results[name] = {'ok': False, 'detail': f'{e.__class__.__name__}: {e}'}
+    return results
+
+
+@app.route('/api/sms-forward/test', methods=['POST'])
+def api_sms_forward_test():
+    try:
+        results = _forward_one_sms('10086', '这是一条 DJiPhone Kit 短信转发测试消息')
+        return jsonify({'ok': True, 'results': results})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+def _sms_forward_loop():
+    """后台轮询新短信并转发。首轮只记录不转发，避免刷历史短信。"""
+    time.sleep(6)  # 避开启动期其他线程的 USB 并发枚举
+    while True:
+        try:
+            cfg = settings.get_all().get('sms_forward') or {}
+            msgs = modem.list_sms('ALL') if (cfg.get('enabled') or not _forward_state['primed']) else []
+            current = {}
+            for m in msgs:
+                stat = (m.get('status') or '')
+                if not stat.startswith('REC'):
+                    continue  # 只关心收到的短信
+                mid = f"recv_{m.get('index')}"
+                h = hashlib.sha1(f"{m.get('sender')}|{m.get('timestamp')}|{m.get('content')}".encode()).hexdigest()
+                current[mid] = h
+                old = _forward_state['seen'].get(mid)
+                if _forward_state['primed'] and cfg.get('enabled') and old != h:
+                    _forward_one_sms(m.get('sender', ''), m.get('content', ''), m.get('timestamp', ''))
+            _forward_state['seen'] = current
+            _forward_state['primed'] = True
+        except Exception:
+            pass
+        time.sleep(10)
+
+
+forward_thread = threading.Thread(target=_sms_forward_loop, daemon=True)
+forward_thread.start()
+
+
+# ─── Voice Runtime 模块侧语音运行时 ──────────────────────────────────
+import voice_runtime
+
+
+@app.route('/api/voice/runtime')
+def api_voice_runtime():
+    return jsonify({'ok': True, **voice_runtime.voice_status()})
+
+
+@app.route('/api/voice/provision', methods=['POST'])
+def api_voice_provision():
+    data = request.get_json(force=True) or {}
+    if not data.get('confirm'):
+        return jsonify({'ok': False, 'error': '需要确认后才会从上游获取模块侧语音运行时'}), 400
+    try:
+        voice_runtime.provision_runtime()
+        return jsonify({'ok': True, **voice_runtime.voice_status()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), **voice_runtime.voice_status()}), 502
+
+
+@app.route('/api/voice/start', methods=['POST'])
+def api_voice_start():
+    try:
+        voice_runtime.ensure_voice_route()
+        return jsonify({'ok': True, **voice_runtime.voice_status()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), **voice_runtime.voice_status()}), 502
+
+
+@app.route('/api/voice/stop', methods=['POST'])
+def api_voice_stop():
+    try:
+        voice_runtime.stop_voice_route()
+        return jsonify({'ok': True, **voice_runtime.voice_status()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), **voice_runtime.voice_status()}), 502
 
 
 # ─── Call API ────────────────────────────────────────────────────────

@@ -1,15 +1,32 @@
 #!/bin/bash
 # EG25-G SMS Web Server 启动脚本
 # 启动后自动打开浏览器 http://localhost:8080
+# 自动适配：libusb 路径（Apple Silicon / Intel）与 Python venv 路径
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-export DYLD_LIBRARY_PATH=/opt/homebrew/lib
-PYTHON="/Users/zxd/.workbuddy/binaries/python/envs/default/bin/python3"
 PORT=8080
+
+# --- 自动探测 libusb 路径 ---
+if [ -d "/opt/homebrew/lib" ]; then
+  export DYLD_LIBRARY_PATH=/opt/homebrew/lib
+elif [ -d "/usr/local/lib" ]; then
+  export DYLD_LIBRARY_PATH=/usr/local/lib
+fi
+
+# --- 自动探测 Python venv ---
+if [ -x "$HOME/.workbuddy/binaries/python/envs/default/bin/python3" ]; then
+  PYTHON="$HOME/.workbuddy/binaries/python/envs/default/bin/python3"
+elif [ -x "/Users/zxd/.workbuddy/binaries/python/envs/default/bin/python3" ]; then
+  PYTHON="/Users/zxd/.workbuddy/binaries/python/envs/default/bin/python3"
+else
+  PYTHON=python3
+fi
 
 echo "================================"
 echo "  EG25-G 短信助手"
 echo "================================"
+echo "Python: $PYTHON"
+echo "DYLD_LIBRARY_PATH: $DYLD_LIBRARY_PATH"
 echo ""
 
 # 检查端口是否被占用
