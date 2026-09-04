@@ -19,13 +19,19 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$RES"
 cp "$REPO_DIR/sms_server.py" "$REPO_DIR/voice_runtime.py" "$REPO_DIR/menubar.py" \
    "$REPO_DIR/index.html" "$REPO_DIR/mobile.html" "$REPO_DIR/manifest.webmanifest" \
    "$REPO_DIR/app.py" "$RES/"
-mkdir -p "$RES/assets"
-cp "$REPO_DIR/assets/icon.png" "$RES/assets/icon.png"
-
-# --- 图标（优先仓库 assets，退回 /tmp/appicon.icns）---
+# --- 图标：icns 优先；仅有 png 时用 iconutil 现场生成；都没有则跳过 ---
 if [ -f "$REPO_DIR/assets/icon.icns" ]; then
   cp "$REPO_DIR/assets/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
-else
+elif [ -f "$REPO_DIR/assets/icon.png" ]; then
+  ICONSET="$(mktemp -d)/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for S in 16 32 64 128 256 512; do
+    sips -z $S $S "$REPO_DIR/assets/icon.png" --out "$ICONSET/icon_${S}x${S}.png" >/dev/null
+    D=$((S*2))
+    sips -z $D $D "$REPO_DIR/assets/icon.png" --out "$ICONSET/icon_${S}x${S}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
+elif [ -f /tmp/appicon.icns ]; then
   cp /tmp/appicon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 
