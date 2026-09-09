@@ -101,3 +101,13 @@
 - mobile.html 缺 #pages 闭合 div（HTMLParser 校验发现并修复）；build_app.sh 拷贝清单加入 menubar.py，版本 4.0。
 ### 验证
 桌面/mobile 均 200，两份 HTML 标签配平 OK、JS 语法 node --check OK；App（PID 运行中）v4.0。注意：当前 USB 模块未插入（/dev/cu.* 无模组端口），/api/status 返回 connected:false 属正常——插回模块即恢复。
+
+## 2026-09-09：QADBKEY 解锁 + 模块语音运行时部署成功，15-18 秒挂断根治
+### 根因闭环
+此前"usbcfg ADB 位写不进"并非固件硬锁——缺 QADBKEY 解锁步骤。流程：`AT+QADBKEY?` 得挑战值 → 密码=`openssl passwd -1 -salt <挑战> SH_adb_quectel` 的第 4 段（22 字符）→ `AT+QADBKEY="<密码>"`（返回 OK，持久）。之后 usbcfg 写 `…,1,1,1,1,1,1,1` 读回保持，CFUN 重启后 USB 枚举出 ADB 接口（if#6, sub0x42/proto0x01）。
+### 运行时部署（adb root, mdm9607/3.18.44/armv7）
+来源 moluncn/mavo `Resources/ModuleVoice`（SHA256 与多项目 pin 一致）。推 /tmp/mavo-call → insmod qdc507_aprv3.ko + qdc507_voice.ko → 声卡 mdm9607-tomtom-i2s-snd-card 出现 → /usr/bin/alsaucm_test 校准（verb VoLTE, Auxpcm Rx/Tx，等待 "ACDB -> Sent VocProc Cal!"）→ mavo-pcm-bridge.armv7 --voice-route-session 激活 hw:0,4。运行时已备份至模块 /data/mavo-call。
+### 实测
+ATD10010; 通话 ACTIVE >60s（旧 bug 15-18s 必挂），CHUP 后 CEER 6,256 正常。macOS 出现 AC Interface / AS Interface（BAIWANG USB Audio 8kHz）。
+### 待办
+模块每次重启后需重跑 insmod+校准+route session（可集成进 DJiPhone Kit 启动自愈）；Mac 侧 8kHz 音频路由（AC→扬声器、麦克风→AS）待接入 App；CellBridge SIP 网关移植评估继续。

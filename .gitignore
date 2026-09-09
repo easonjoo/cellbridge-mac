@@ -25,3 +25,6 @@ data_usage.json
 cover_plan_*/
 xiaohongshu_post.md
 douyin_post.md
+
+# 模块侧语音运行时（闭源二进制不进仓库；voice_runtime.provision_runtime() 可在线下载并 SHA-256 校验）
+voice-runtime/

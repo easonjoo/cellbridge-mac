@@ -19,6 +19,17 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$RES"
 cp "$REPO_DIR/sms_server.py" "$REPO_DIR/voice_runtime.py" "$REPO_DIR/menubar.py" \
    "$REPO_DIR/index.html" "$REPO_DIR/mobile.html" "$REPO_DIR/manifest.webmanifest" \
    "$REPO_DIR/app.py" "$RES/"
+# --- 模块侧语音运行时（本地已就位则直接打包；否则 App 内可在线下载校验）---
+if [ -d "$REPO_DIR/voice-runtime" ]; then
+  cp -R "$REPO_DIR/voice-runtime" "$RES/voice-runtime"
+fi
+# --- Mac 通话音频桥（Swift CoreAudio，运行时动态编译）---
+if command -v swiftc >/dev/null 2>&1 && [ -f "$REPO_DIR/voice_audio_bridge.swift" ]; then
+  mkdir -p "$RES/bin"
+  echo "编译 voice-audio-bridge ..."
+  swiftc -O "$REPO_DIR/voice_audio_bridge.swift" -o "$RES/bin/voice-audio-bridge" 2>/dev/null \
+    && echo "音频桥编译完成" || echo "警告：音频桥编译失败（跳过）"
+fi
 # --- 图标：icns 优先；仅有 png 时用 iconutil 现场生成；都没有则跳过 ---
 if [ -f "$REPO_DIR/assets/icon.icns" ]; then
   cp "$REPO_DIR/assets/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"

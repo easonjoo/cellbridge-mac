@@ -675,7 +675,12 @@ class CallManager:
                 if len(parts) >= 5:
                     try:
                         stat = int(parts[2].strip())
+                        mode = int(parts[3].strip())
                     except ValueError:
+                        continue
+                    # 过滤非语音呼叫：模块挂断后固件会残留 mode=1(数据) 的幽灵条目，
+                    # 导致状态机卡死、语音路由无法拆除。真实语音呼叫 mode=0。
+                    if mode != 0:
                         continue
                     calls.append({
                         'dir': parts[1].strip(),
@@ -741,9 +746,9 @@ class CallManager:
                 self._hungup_number = ''  # 模组确认无通话,清除标记
                 self._teardown_voice()
 
-    # ---- 模块侧语音路由（voice_runtime）通话期钩子 ----
+    # ---- 模块侧语音路由（voice_runtime）+ Mac 音频桥 通话期钩子 ----
     def _ensure_voice_for_call(self):
-        """通话进入 active 时后台准备模块侧语音路由（幂等）。"""
+        """通话进入 active 时后台准备模块侧语音路由与 Mac 音频桥（幂等）。"""
         if self._voice_prepared:
             return
         self._voice_prepared = True
@@ -755,10 +760,18 @@ class CallManager:
                 # 失败则复位标记，下次通话状态变化时重试
                 self._voice_prepared = False
                 print(f'语音路由准备失败: {e}', file=sys.stderr)
+                return
+            # 通话可能已在路由准备期间结束（拆线把标记复位）——不再启动音频桥
+            if not self._voice_prepared:
+                return
+            try:
+                start_audio_bridge()
+            except Exception as e:
+                print(f'Mac 音频桥启动失败: {e}', file=sys.stderr)
         threading.Thread(target=_prep, daemon=True).start()
 
     def _teardown_voice(self):
-        """通话结束后拆除语音路由。"""
+        """通话结束后拆除语音路由与音频桥。"""
         if not self._voice_prepared:
             return
         self._voice_prepared = False
@@ -768,6 +781,10 @@ class CallManager:
                 voice_runtime.stop_voice_route()
             except Exception as e:
                 print(f'语音路由停止失败: {e}', file=sys.stderr)
+            try:
+                stop_audio_bridge()
+            except Exception as e:
+                print(f'Mac 音频桥停止失败: {e}', file=sys.stderr)
         threading.Thread(target=_stop, daemon=True).start()
 
     def get_status(self):
@@ -1765,6 +1782,57 @@ forward_thread.start()
 
 # ─── Voice Runtime 模块侧语音运行时 ──────────────────────────────────
 import voice_runtime
+
+
+# ─── Mac 通话音频桥（voice-audio-bridge，Swift CoreAudio） ────────────
+import subprocess
+
+_audio_bridge_proc = None
+_audio_bridge_lock = threading.Lock()
+
+
+def _bridge_binary():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, 'bin', 'voice-audio-bridge'),
+              os.path.join(here, 'voice-audio-bridge'),
+              os.path.join(os.path.dirname(here), 'bin', 'voice-audio-bridge')):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def start_audio_bridge():
+    """启动 Mac 侧通话音频桥（AC Interface→扬声器，麦克风→AS Interface）。"""
+    global _audio_bridge_proc
+    with _audio_bridge_lock:
+        if _audio_bridge_proc and _audio_bridge_proc.poll() is None:
+            return True
+        b = _bridge_binary()
+        if not b:
+            print('voice-audio-bridge 二进制不存在，跳过 Mac 音频桥', file=sys.stderr)
+            return False
+        _audio_bridge_proc = subprocess.Popen(
+            [b, '--verbose'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+
+
+def stop_audio_bridge():
+    global _audio_bridge_proc
+    with _audio_bridge_lock:
+        if _audio_bridge_proc and _audio_bridge_proc.poll() is None:
+            _audio_bridge_proc.terminate()
+            try:
+                _audio_bridge_proc.wait(timeout=5)
+            except Exception:
+                _audio_bridge_proc.kill()
+        _audio_bridge_proc = None
+
+
+@app.route('/api/voice/bridge')
+def api_voice_bridge():
+    with _audio_bridge_lock:
+        running = bool(_audio_bridge_proc and _audio_bridge_proc.poll() is None)
+    return jsonify({'ok': True, 'running': running, 'binary': _bridge_binary()})
 
 
 @app.route('/api/voice/runtime')

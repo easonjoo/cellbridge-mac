@@ -162,7 +162,7 @@ class ADBClient:
         return struct.pack('<6I', cmd, arg0, arg1, len(payload),
                            sum(payload) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF)
 
-    def _send(self, cmd, arg0, arg1, payload, timeout_ms=2000):
+    def _send(self, cmd, arg0, arg1, payload=b'', timeout_ms=2000):
         self._bulk_write(self._header(cmd, arg0, arg1, payload), timeout_ms)
         if payload:
             self._bulk_write(payload, timeout_ms)
@@ -432,15 +432,27 @@ def _ensure_calibration(adb):
 
 
 def _route_is_ready(adb):
+    """严格判定：bridge 存活 + 日志激活 + audio_enable + PCM 双向 RUNNING。"""
+    return _route_state(adb, strict=True)
+
+
+def _route_is_active(adb):
+    """宽松判定：bridge 进程存活且日志已报告 VoLTE route session active。
+    （audio_enable 与 PCM RUNNING 需等 Mac 打开 UAC 流，可能滞后数秒）"""
+    return _route_state(adb, strict=False)
+
+
+def _route_state(adb, strict):
     helper = VOICE_REMOTE_DIR + '/mavo-pcm-bridge.armv7'
     cmd = (f"test -s '{ROUTE_PID_FILE}' && read pid expected_start < '{ROUTE_PID_FILE}' && "
-           'test "$(cut -d \' \' -f 22 \'/proc/$pid/stat\' 2>/dev/null)" = "$expected_start" && '
-           f'test "$(tr \'\\000\' \'\\n\' < \'/proc/$pid/cmdline\' 2>/dev/null | sed -n \'1p\')" = \'{helper}\' && '
+           'test "$(cut -d \' \' -f 22 "/proc/$pid/stat" 2>/dev/null)" = "$expected_start" && '
+           f'test "$(tr \'\\000\' \'\\n\' < "/proc/$pid/cmdline" 2>/dev/null | sed -n \'1p\')" = \'{helper}\' && '
            'tr \'\\000\' \'\\n\' < "/proc/$pid/cmdline" 2>/dev/null | grep -q \'^--voice-route-session$\' && '
-           f"grep -q 'VoLTE route session active on hw:0,4' '{ROUTE_LOG_FILE}' && "
-           'test "$(cat /sys/class/android_usb/f_audio/audio_enable)" = 1 && '
-           "grep -q '^state: RUNNING' /proc/asound/card0/pcm4p/sub0/status && "
-           "grep -q '^state: RUNNING' /proc/asound/card0/pcm4c/sub0/status")
+           f"grep -q 'VoLTE route session active on hw:0,4' '{ROUTE_LOG_FILE}'")
+    if strict:
+        cmd += (' && test "$(cat /sys/class/android_usb/f_audio/audio_enable)" = 1 && '
+                "grep -q '^state: RUNNING' /proc/asound/card0/pcm4p/sub0/status && "
+                "grep -q '^state: RUNNING' /proc/asound/card0/pcm4c/sub0/status")
     try:
         _, status = adb.shell_checked(cmd, 8)
     except ADBAuthRequired:
@@ -538,6 +550,13 @@ def _start_voice_route():
         # 路由已就绪？
         if _route_is_ready(adb):
             return
+        if _route_is_active(adb):
+            return  # 旧实例仍在服务，直接视为就绪
+        # 清理残留 bridge（避免 PCM EBUSY）再启动（[.] 防止 pkill 匹配到自身 shell）
+        _voice_shell(adb, "pkill -f 'mavo-pcm-bridge[.]armv7' 2>/dev/null; "
+                          "n=0; while pgrep -f 'mavo-pcm-bridge[.]armv7' >/dev/null && test \"$n\" -lt 30; do "
+                          'sleep 0.1; n=$((n+1)); done; pgrep -f "mavo-pcm-bridge[.]armv7" >/dev/null && exit 74; '
+                          f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}'", 15)
         helper = f'{VOICE_REMOTE_DIR}/mavo-pcm-bridge.armv7'
         launch = (f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}'; "
                   f"nohup '{helper}' --voice-route-session --verbose "
@@ -561,6 +580,13 @@ def _start_voice_route():
         for _ in range(30):
             if _route_is_ready(adb):
                 return
+            if _route_is_active(adb):
+                # bridge 已激活，等 Mac 打开 UAC 流后 RUNNING 会跟上
+                for _ in range(100):
+                    if _route_is_ready(adb):
+                        return
+                    time.sleep(0.2)
+                return  # 宽松成功：bridge 存活即认为路由就绪
             time.sleep(0.1)
         route_log, _ = adb.shell_checked(f"test ! -f '{ROUTE_LOG_FILE}' || tail -n 160 '{ROUTE_LOG_FILE}'", 8)
         detail = route_log.strip()[-1000:]
