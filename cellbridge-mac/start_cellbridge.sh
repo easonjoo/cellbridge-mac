@@ -33,6 +33,20 @@ if [ "${1:-}" = "stop" ]; then
   exit 0
 fi
 
+# --- CS 语音路由（DJI 固件无 VoLTE，CSFB 语音需手动路由到 AFE_PCM/USB）---
+# 模块重启后 mixer 复位，每次启动时重新写入；mini_tinymix 由 module-tools 交叉编译
+echo "[0/3] 写入 CS 语音路由（AFE_PCM ↔ CSVoice）..."
+if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb" ]; then
+  export PATH="$HOME/Applications/platform-tools:$PATH"
+  adb shell '
+    [ -x /data/mini_tinymix ] || exit 0
+    /data/mini_tinymix set "AFE_PCM_RX_Voice Mixer CSVoice" 1
+    /data/mini_tinymix set "Voice_Tx Mixer AFE_PCM_TX_Voice" 1
+  ' 2>/dev/null && echo "    CS 路由已写入" || echo "    警告：CS 路由写入失败（模块未连接？）"
+else
+  echo "    警告：找不到 adb，跳过 CS 路由写入"
+fi
+
 # --- 前置检查 ---
 for f in "$APP_PY" "$BRIDGE" "$GATEWAY"; do
   if [ ! -f "$f" ]; then
