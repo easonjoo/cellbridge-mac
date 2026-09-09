@@ -1,8 +1,14 @@
 // voice-audio-bridge — DJiPhone Kit 通话音频桥（macOS）
-// 方向 1：模块 UAC "AC Interface"(8kHz, 蜂窝→Mac)  → Mac 默认输出（扬声器）
-// 方向 2：Mac 默认输入（麦克风）→ 模块 UAC "AS Interface"(8kHz, Mac→蜂窝)
 //
-// 用法：voice-audio-bridge [--in-name AC] [--out-name AS] [--verbose]
+// 模式 1（默认，App 通话）：
+//   模块 UAC "AC Interface"(8kHz, 蜂窝→Mac) → Mac 默认输出（扬声器）
+//   Mac 默认输入（麦克风）→ 模块 UAC "AS Interface"(8kHz, Mac→蜂窝)
+//
+// 模式 2（--fifo-rx/--fifo-tx，CellBridge SIP 网关）：
+//   蜂窝音频（AC Interface）→ s16le 8k mono 写入 rx FIFO（网关读）
+//   tx FIFO（网关写）→ 蜂窝（AS Interface）
+//   对应 CellBridge voice.backend=raw-pcm（rx_path/tx_path）。
+//
 // 退出：SIGTERM/SIGINT 时干净停止。
 
 import Foundation
@@ -51,7 +57,7 @@ func getDevices() -> [(id: AudioDeviceID, name: String)] {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMaster)
+        mElement: kAudioObjectPropertyElementMain)
     var size: UInt32 = 0
     var status = AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size)
     guard status == noErr else { return [] }
@@ -63,7 +69,7 @@ func getDevices() -> [(id: AudioDeviceID, name: String)] {
         var nameAddr = AudioObjectPropertyAddress(
             mSelector: kAudioObjectPropertyName,
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster)
+            mElement: kAudioObjectPropertyElementMain)
         var cfName: CFString? = nil
         var nameSize = UInt32(MemoryLayout<CFString?>.size)
         if AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nameSize, &cfName) == noErr,
@@ -87,7 +93,7 @@ func defaultDevice(_ scope: AudioObjectPropertyScope) -> AudioDeviceID? {
             ? kAudioHardwarePropertyDefaultOutputDevice
             : kAudioHardwarePropertyDefaultInputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMaster)
+        mElement: kAudioObjectPropertyElementMain)
     var id = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
     guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr, id != 0 else {
@@ -98,7 +104,7 @@ func defaultDevice(_ scope: AudioObjectPropertyScope) -> AudioDeviceID? {
 
 let SAMPLE_RATE: Float64 = 8000
 
-func makeFormat() -> AudioStreamBasicDescription {
+func makeFloatFormat() -> AudioStreamBasicDescription {
     AudioStreamBasicDescription(
         mSampleRate: SAMPLE_RATE,
         mFormatID: kAudioFormatLinearPCM,
@@ -108,7 +114,17 @@ func makeFormat() -> AudioStreamBasicDescription {
         mBitsPerChannel: 32, mReserved: 0)
 }
 
-// HAL 单元：一个 AUHAL 同时配输入设备与输出方向。direction=false 表示输入捕获。
+func makeS16Format() -> AudioStreamBasicDescription {
+    AudioStreamBasicDescription(
+        mSampleRate: SAMPLE_RATE,
+        mFormatID: kAudioFormatLinearPCM,
+        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        mBytesPerPacket: 2, mFramesPerPacket: 1,
+        mBytesPerFrame: 2, mChannelsPerFrame: 1,
+        mBitsPerChannel: 16, mReserved: 0)
+}
+
+// HAL 单元：enableInput 开 element 1 的输入捕获，enableOutput 开 element 0 的输出。
 func makeHALUnit(device: AudioDeviceID, enableInput: Bool, enableOutput: Bool) -> AudioUnit? {
     var au: AudioUnit?
     var comp = AudioComponentDescription(
@@ -120,7 +136,6 @@ func makeHALUnit(device: AudioDeviceID, enableInput: Bool, enableOutput: Bool) -
     guard AudioComponentInstanceNew(compRef, &au) == noErr, let au = au else { return nil }
 
     var one: UInt32 = 1, zero: UInt32 = 0
-    // element 1 = input side, element 0 = output side
     AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &one, UInt32(MemoryLayout<UInt32>.size))
     AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &zero, UInt32(MemoryLayout<UInt32>.size))
     if enableOutput {
@@ -146,57 +161,217 @@ func setInputFormat(_ au: AudioUnit, _ fmt: UnsafePointer<AudioStreamBasicDescri
     return AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)) == noErr
 }
 
-// MARK: - 桥接通道
+typealias AUProc = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<AudioUnitRenderActionFlags>, UnsafePointer<AudioTimeStamp>, UInt32, UInt32, UnsafeMutablePointer<AudioBufferList>?) -> OSStatus
+
+func installCallback(_ au: AudioUnit, _ refCon: UnsafeMutableRawPointer, proc: AUProc, isInput: Bool) -> Bool {
+    var cb = AURenderCallbackStruct(inputProc: proc, inputProcRefCon: refCon)
+    if isInput {
+        return AudioUnitSetProperty(au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+    }
+    return AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+}
+
+// MARK: - 模式 1：App 通话桥（扬声器 + 麦克风）
 final class Channel {
     let ring = RingBuffer()
     var inputUnit: AudioUnit?
     var outputUnit: AudioUnit?
     let label: String
-    var verbose = false
     var totalFrames: UInt64 = 0
 
     init(label: String) { self.label = label }
 }
 
-func inputCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+private func channelInputCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let ch = Unmanaged<Channel>.fromOpaque(inRefCon).takeUnretainedValue()
     guard let ablPtr = ioData else { return -1 }
-    var status = AudioUnitRender(ch.inputUnit!, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
+    let status = AudioUnitRender(ch.inputUnit!, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
     guard status == noErr else { return status }
     let bufPtr = ablPtr.pointee.mBuffers
-    if bufPtr.mData != nil, bufPtr.mNumberChannels == 1 || bufPtr.mNumberChannels >= 1 {
+    if bufPtr.mData != nil {
         let floats = bufPtr.mData!.assumingMemoryBound(to: Float.self)
-        let frames = Int(inNumberFrames)
-        ch.ring.write(floats, count: frames)
-        ch.totalFrames += UInt64(frames)
+        ch.ring.write(floats, count: Int(inNumberFrames))
+        ch.totalFrames += UInt64(inNumberFrames)
     }
     return noErr
 }
 
-func renderCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+private func channelRenderCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let ch = Unmanaged<Channel>.fromOpaque(inRefCon).takeUnretainedValue()
     guard let ablPtr = ioData else { return -1 }
     let bufPtr = ablPtr.pointee.mBuffers
     guard let data = bufPtr.mData else { return -1 }
     let floats = data.assumingMemoryBound(to: Float.self)
-    let frames = Int(inNumberFrames)
-    let got = ch.ring.read(floats, count: frames)
-    if got < frames {
-        for i in got..<frames { floats[i] = 0 }  // 欠载补零
+    let got = ch.ring.read(floats, count: Int(inNumberFrames))
+    if got < Int(inNumberFrames) {
+        for i in got..<Int(inNumberFrames) { floats[i] = 0 }  // 欠载补零
     }
     return noErr
 }
 
-func installCallback(_ au: AudioUnit, _ ch: Channel, isInput: Bool) -> Bool {
-    let proc: @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<AudioUnitRenderActionFlags>, UnsafePointer<AudioTimeStamp>, UInt32, UInt32, UnsafeMutablePointer<AudioBufferList>?) -> OSStatus
-        = isInput ? inputCallback : renderCallback
-    var cb = AURenderCallbackStruct(
-        inputProc: proc,
-        inputProcRefCon: Unmanaged.passUnretained(ch).toOpaque())
-    if isInput {
-        return AudioUnitSetProperty(au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+func runBridgeMode(acDevice: AudioDeviceID, asDevice: AudioDeviceID, macIn: AudioDeviceID, macOut: AudioDeviceID, verbose: Bool) {
+    let down = Channel(label: "cellular->mac")   // AC 蜂窝进 Mac 扬声器
+    let up = Channel(label: "mac->cellular")     // 麦克风进 AS 蜂窝
+
+    var fmt = makeFloatFormat()
+
+    down.inputUnit = makeHALUnit(device: acDevice, enableInput: true, enableOutput: false)
+    down.outputUnit = makeHALUnit(device: macOut, enableInput: false, enableOutput: true)
+    up.inputUnit = makeHALUnit(device: macIn, enableInput: true, enableOutput: false)
+    up.outputUnit = makeHALUnit(device: asDevice, enableInput: false, enableOutput: true)
+
+    for ch in [down, up] {
+        guard let iu = ch.inputUnit, let ou = ch.outputUnit else {
+            FileHandle.standardError.write("AudioUnit 创建失败（\(ch.label)）\n".data(using: .utf8)!)
+            exit(3)
+        }
+        let iuRef = Unmanaged.passUnretained(ch).toOpaque()
+        guard setClientFormat(iu, &fmt), setInputFormat(iu, &fmt),
+              setClientFormat(ou, &fmt),
+              installCallback(iu, iuRef, proc: channelInputCallback, isInput: true),
+              installCallback(ou, iuRef, proc: channelRenderCallback, isInput: false),
+              AudioUnitInitialize(iu) == noErr,
+              AudioUnitInitialize(ou) == noErr else {
+            FileHandle.standardError.write("AudioUnit 配置失败（\(ch.label)）\n".data(using: .utf8)!)
+            exit(3)
+        }
+        guard AudioOutputUnitStart(iu) == noErr, AudioOutputUnitStart(ou) == noErr else {
+            FileHandle.standardError.write("AudioUnit 启动失败（\(ch.label)）\n".data(using: .utf8)!)
+            exit(3)
+        }
     }
-    return AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size)) == noErr
+
+    FileHandle.standardError.write("voice-audio-bridge 运行中：AC Interface→扬声器，麦克风→AS Interface\n".data(using: .utf8)!)
+
+    var lastDown: UInt64 = 0, lastUp: UInt64 = 0
+    while !interrupted {
+        Thread.sleep(forTimeInterval: 5)
+        let d = down.totalFrames, u = up.totalFrames
+        if verbose {
+            FileHandle.standardError.write(String(format: "[stats] down=%llu fr (%llu fr/s) up=%llu fr (%llu fr/s)\n", d - lastDown, (d - lastDown) / 5, u - lastUp, (u - lastUp) / 5).data(using: .utf8)!)
+        }
+        lastDown = d; lastUp = u
+    }
+
+    for ch in [down, up] {
+        if let iu = ch.inputUnit { AudioOutputUnitStop(iu); AudioUnitUninitialize(iu) }
+        if let ou = ch.outputUnit { AudioOutputUnitStop(ou); AudioUnitUninitialize(ou) }
+    }
+}
+
+// MARK: - 模式 2：FIFO（CellBridge raw-pcm 后端）
+final class FifoLink {
+    var unit: AudioUnit?
+    var fd: Int32 = -1
+    let label: String
+    var totalFrames: UInt64 = 0
+    var droppedBytes: UInt64 = 0
+
+    init(label: String) { self.label = label }
+}
+
+// AC 捕获 → rx FIFO（网关读=对方声音）。非阻塞写，FIFO 满则丢弃并计数。
+private func fifoCaptureCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    let link = Unmanaged<FifoLink>.fromOpaque(inRefCon).takeUnretainedValue()
+    guard let ablPtr = ioData, link.fd >= 0 else { return noErr }
+    let status = AudioUnitRender(link.unit!, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
+    guard status == noErr else { return status }
+    let bufPtr = ablPtr.pointee.mBuffers
+    guard let data = bufPtr.mData else { return noErr }
+    let byteCount = Int(inNumberFrames) * 2  // s16le mono
+    var written = 0
+    while written < byteCount {
+        let n = write(link.fd, data + written, byteCount - written)
+        if n > 0 { written += n; continue }
+        if errno == EINTR { continue }
+        link.droppedBytes += UInt64(byteCount - written)  // EAGAIN：网关没在取流
+        break
+    }
+    link.totalFrames += UInt64(inNumberFrames)
+    return noErr
+}
+
+// tx FIFO（网关写=己方声音）→ AS 播放。非阻塞读，无数据补零。
+private func fifoPlaybackCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+    let link = Unmanaged<FifoLink>.fromOpaque(inRefCon).takeUnretainedValue()
+    guard let ablPtr = ioData else { return -1 }
+    let bufPtr = ablPtr.pointee.mBuffers
+    guard let data = bufPtr.mData else { return -1 }
+    let bytes = Int(bufPtr.mDataByteSize)
+    memset(data, 0, bytes)
+    guard link.fd >= 0 else { return noErr }
+    var got = 0
+    while got < bytes {
+        let n = read(link.fd, data + got, bytes - got)
+        if n > 0 { got += n; continue }
+        break  // EAGAIN / EOF：补零即可
+    }
+    link.totalFrames += UInt64(inNumberFrames)
+    return noErr
+}
+
+func runFifoMode(acDevice: AudioDeviceID, asDevice: AudioDeviceID, rxPath: String, txPath: String, verbose: Bool) {
+    let rxLink = FifoLink(label: "cellular->fifo")
+    let txLink = FifoLink(label: "fifo->cellular")
+
+    // 1) tx FIFO 读端：O_RDONLY|O_NONBLOCK 立即成功，网关写端随后接上
+    txLink.fd = open(txPath, O_RDONLY | O_NONBLOCK)
+    guard txLink.fd >= 0 else {
+        FileHandle.standardError.write("打开 tx FIFO（\(txPath)）失败：\(String(cString: strerror(errno)))\n".data(using: .utf8)!)
+        exit(4)
+    }
+    // 2) rx FIFO 写端：阻塞开（与网关的阻塞读端配对），后台线程等网关
+    let rxOpen = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        let fd = open(rxPath, O_WRONLY)
+        rxLink.fd = fd
+        rxOpen.signal()
+    }
+    FileHandle.standardError.write("等待网关打开 rx FIFO（\(rxPath)）...\n".data(using: .utf8)!)
+    if rxOpen.wait(timeout: .now() + 120) == .timedOut || rxLink.fd < 0 {
+        FileHandle.standardError.write("等待 rx FIFO 读者超时（网关未启动？）\n".data(using: .utf8)!)
+        exit(4)
+    }
+
+    var s16 = makeS16Format()
+
+    rxLink.unit = makeHALUnit(device: acDevice, enableInput: true, enableOutput: false)
+    txLink.unit = makeHALUnit(device: asDevice, enableInput: false, enableOutput: true)
+    guard let riu = rxLink.unit, let tou = txLink.unit else {
+        FileHandle.standardError.write("AudioUnit 创建失败（FIFO 模式）\n".data(using: .utf8)!)
+        exit(3)
+    }
+    let rxRef = Unmanaged.passUnretained(rxLink).toOpaque()
+    let txRef = Unmanaged.passUnretained(txLink).toOpaque()
+    guard setClientFormat(riu, &s16), setInputFormat(riu, &s16),
+          setClientFormat(tou, &s16),
+          installCallback(riu, rxRef, proc: fifoCaptureCallback, isInput: true),
+          installCallback(tou, txRef, proc: fifoPlaybackCallback, isInput: false),
+          AudioUnitInitialize(riu) == noErr,
+          AudioUnitInitialize(tou) == noErr else {
+        FileHandle.standardError.write("AudioUnit 配置失败（FIFO 模式）\n".data(using: .utf8)!)
+        exit(3)
+    }
+    guard AudioOutputUnitStart(riu) == noErr, AudioOutputUnitStart(tou) == noErr else {
+        FileHandle.standardError.write("AudioUnit 启动失败（FIFO 模式）\n".data(using: .utf8)!)
+        exit(3)
+    }
+
+    FileHandle.standardError.write("voice-audio-bridge FIFO 模式运行中：AC Interface→\(rxPath)，\(txPath)→AS Interface（s16le 8k mono）\n".data(using: .utf8)!)
+
+    var lastRx: UInt64 = 0, lastTx: UInt64 = 0, lastDrop: UInt64 = 0
+    while !interrupted {
+        Thread.sleep(forTimeInterval: 5)
+        if verbose {
+            let r = rxLink.totalFrames, t = txLink.totalFrames, dp = rxLink.droppedBytes
+            FileHandle.standardError.write(String(format: "[stats] cellular->fifo=%llu fr (%llu fr/s) fifo->cellular=%llu fr (%llu fr/s) dropped=%llu B\n", r - lastRx, (r - lastRx) / 5, t - lastTx, (t - lastTx) / 5, dp - lastDrop).data(using: .utf8)!)
+        }
+        lastRx = rxLink.totalFrames; lastTx = txLink.totalFrames; lastDrop = rxLink.droppedBytes
+    }
+
+    if let iu = rxLink.unit { AudioOutputUnitStop(iu); AudioUnitUninitialize(iu) }
+    if let ou = txLink.unit { AudioOutputUnitStop(ou); AudioUnitUninitialize(ou) }
+    close(rxLink.fd); close(txLink.fd)
 }
 
 // MARK: - 主流程
@@ -225,63 +400,18 @@ guard let asDevice = findDevice(matching: cellularOutName) else {
     FileHandle.standardError.write("找不到模块 UAC 输出设备（含 \(cellularOutName)）\n".data(using: .utf8)!)
     exit(2)
 }
-guard let macOut = defaultDevice(kAudioObjectPropertyScopeOutput) else {
-    FileHandle.standardError.write("找不到 Mac 默认输出设备\n".data(using: .utf8)!)
-    exit(2)
-}
-guard let macIn = defaultDevice(kAudioObjectPropertyScopeInput) else {
-    FileHandle.standardError.write("找不到 Mac 默认输入设备\n".data(using: .utf8)!)
-    exit(2)
-}
 
-let down = Channel(label: "cellular->mac")   // AC 蜂窝进 Mac 扬声器
-let up = Channel(label: "mac->cellular")     // 麦克风进 AS 蜂窝
-down.verbose = verbose; up.verbose = verbose
-
-var fmt = makeFormat()
-
-// 方向 1：输入=AC 设备（蜂窝），输出=Mac 扬声器
-down.inputUnit = makeHALUnit(device: acDevice, enableInput: true, enableOutput: false)
-down.outputUnit = makeHALUnit(device: macOut, enableInput: false, enableOutput: true)
-// 方向 2：输入=Mac 麦克风，输出=AS 设备（蜂窝）
-up.inputUnit = makeHALUnit(device: macIn, enableInput: true, enableOutput: false)
-up.outputUnit = makeHALUnit(device: asDevice, enableInput: false, enableOutput: true)
-
-for ch in [down, up] {
-    guard let iu = ch.inputUnit, let ou = ch.outputUnit else {
-        FileHandle.standardError.write("AudioUnit 创建失败（\(ch.label)）\n".data(using: .utf8)!)
-        exit(3)
+if let rxPath = argValue("--fifo-rx"), let txPath = argValue("--fifo-tx") {
+    runFifoMode(acDevice: acDevice, asDevice: asDevice, rxPath: rxPath, txPath: txPath, verbose: verbose)
+} else {
+    guard let macOut = defaultDevice(kAudioObjectPropertyScopeOutput) else {
+        FileHandle.standardError.write("找不到 Mac 默认输出设备\n".data(using: .utf8)!)
+        exit(2)
     }
-    guard setClientFormat(iu, &fmt), setInputFormat(iu, &fmt),
-          setClientFormat(ou, &fmt),
-          installCallback(iu, ch, isInput: true),
-          installCallback(ou, ch, isInput: false),
-          AudioUnitInitialize(iu) == noErr,
-          AudioUnitInitialize(ou) == noErr else {
-        FileHandle.standardError.write("AudioUnit 配置失败（\(ch.label)）\n".data(using: .utf8)!)
-        exit(3)
+    guard let macIn = defaultDevice(kAudioObjectPropertyScopeInput) else {
+        FileHandle.standardError.write("找不到 Mac 默认输入设备\n".data(using: .utf8)!)
+        exit(2)
     }
-    guard AudioOutputUnitStart(iu) == noErr, AudioOutputUnitStart(ou) == noErr else {
-        FileHandle.standardError.write("AudioUnit 启动失败（\(ch.label)）\n".data(using: .utf8)!)
-        exit(3)
-    }
-}
-
-FileHandle.standardError.write("voice-audio-bridge 运行中：\(cellularInName)→扬声器，麦克风→\(cellularOutName)\n".data(using: .utf8)!)
-
-// 心跳：每 5 秒打印统计
-var lastDown: UInt64 = 0, lastUp: UInt64 = 0
-while !interrupted {
-    Thread.sleep(forTimeInterval: 5)
-    let d = down.totalFrames, u = up.totalFrames
-    if verbose {
-        FileHandle.standardError.write(String(format: "[stats] down=%llu fr (%llu/s) up=%llu fr (%llu/s)\n", d - lastDown, (d - lastDown) / 5, u - lastUp, (u - lastUp) / 5).data(using: .utf8)!)
-    }
-    lastDown = d; lastUp = u
-}
-
-for ch in [down, up] {
-    if let iu = ch.inputUnit { AudioOutputUnitStop(iu); AudioUnitUninitialize(iu) }
-    if let ou = ch.outputUnit { AudioOutputUnitStop(ou); AudioUnitUninitialize(ou) }
+    runBridgeMode(acDevice: acDevice, asDevice: asDevice, macIn: macIn, macOut: macOut, verbose: verbose)
 }
 FileHandle.standardError.write("voice-audio-bridge 已退出\n".data(using: .utf8)!)

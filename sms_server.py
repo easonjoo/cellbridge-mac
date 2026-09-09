@@ -1801,6 +1801,15 @@ def _bridge_binary():
     return None
 
 
+def _bridge_log_path():
+    base = os.path.expanduser('~/Library/Application Support/DJiPhoneKit')
+    try:
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, 'voice-bridge.log')
+    except Exception:
+        return os.path.join('/tmp', 'djiphone-voice-bridge.log')
+
+
 def start_audio_bridge():
     """启动 Mac 侧通话音频桥（AC Interface→扬声器，麦克风→AS Interface）。"""
     global _audio_bridge_proc
@@ -1811,8 +1820,22 @@ def start_audio_bridge():
         if not b:
             print('voice-audio-bridge 二进制不存在，跳过 Mac 音频桥', file=sys.stderr)
             return False
+        # 清理旧实例残留（App 重启后旧桥可能存活；[b] 防止 pkill 自匹配），
+        # 桥收到 SIGTERM 后最多 ~5s 才退出，轮询等它干净退出再起新实例
+        try:
+            subprocess.run(['pkill', '-f', 'voice-audio-[b]ridge'], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(14):
+                probe = subprocess.run(['pgrep', '-f', 'voice-audio-[b]ridge'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if probe.returncode != 0:
+                    break
+                time.sleep(0.5)
+        except Exception:
+            pass
+        logf = open(_bridge_log_path(), 'ab', buffering=0)
         _audio_bridge_proc = subprocess.Popen(
-            [b, '--verbose'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            [b, '--verbose'], stdout=logf, stderr=logf)
         return True
 
 
@@ -1828,11 +1851,63 @@ def stop_audio_bridge():
         _audio_bridge_proc = None
 
 
+import atexit
+atexit.register(stop_audio_bridge)
+
+
 @app.route('/api/voice/bridge')
 def api_voice_bridge():
     with _audio_bridge_lock:
         running = bool(_audio_bridge_proc and _audio_bridge_proc.poll() is None)
     return jsonify({'ok': True, 'running': running, 'binary': _bridge_binary()})
+
+
+# ─── 语音路由启动自愈：模块上电/重启后自动重部署 ─────────────────────
+_voice_heal_state = {'last_heal': 0.0, 'last_error': ''}
+
+
+def _voice_heal_loop():
+    """监视模块 USB 在位状态：插入/重启消失再出现后，等待网络注册
+    并强制重部署语音路由（insmod + ACDB 校准 + bridge 会话）。"""
+    was_present = None
+    while True:
+        try:
+            present = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID) is not None
+            if was_present is False and not present:
+                voice_runtime.invalidate()
+            if present and was_present is not True:
+                # 刚上电/重启：等 USB 复合设备稳定 + 网络注册
+                time.sleep(20)
+                if usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID) is None:
+                    was_present = present
+                    continue
+                try:
+                    voice_runtime.ensure_voice_route(force=True)
+                    _voice_heal_state['last_heal'] = time.time()
+                    _voice_heal_state['last_error'] = ''
+                    print('[voice-heal] 语音路由自动部署成功', file=sys.stderr)
+                except Exception as e:
+                    _voice_heal_state['last_error'] = str(e)[-300:]
+                    print(f'[voice-heal] 语音路由自动部署失败（通话时会重试）: {e}', file=sys.stderr)
+            was_present = present
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+@app.route('/api/voice/heal')
+def api_voice_heal():
+    return jsonify({
+        'ok': True,
+        'last_heal_ago': int(time.time() - _voice_heal_state['last_heal']) if _voice_heal_state['last_heal'] else None,
+        'last_error': _voice_heal_state['last_error'],
+        **voice_runtime.voice_status(),
+    })
+
+
+# 语音路由启动自愈线程（须在 _voice_heal_loop 定义之后启动）
+voice_heal_thread = threading.Thread(target=_voice_heal_loop, daemon=True)
+voice_heal_thread.start()
 
 
 @app.route('/api/voice/runtime')

@@ -28,3 +28,8 @@ douyin_post.md
 
 # 模块侧语音运行时（闭源二进制不进仓库；voice_runtime.provision_runtime() 可在线下载并 SHA-256 校验）
 voice-runtime/
+
+# CellBridge macOS 移植：网关二进制与运行目录
+cellbridge-mac/cellbridge-gateway
+cellbridge-mac/voice-audio-bridge
+.cellbridge/

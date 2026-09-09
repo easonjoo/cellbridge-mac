@@ -111,3 +111,10 @@
 ATD10010; 通话 ACTIVE >60s（旧 bug 15-18s 必挂），CHUP 后 CEER 6,256 正常。macOS 出现 AC Interface / AS Interface（BAIWANG USB Audio 8kHz）。
 ### 待办
 模块每次重启后需重跑 insmod+校准+route session（可集成进 DJiPhone Kit 启动自愈）；Mac 侧 8kHz 音频路由（AC→扬声器、麦克风→AS）待接入 App；CellBridge SIP 网关移植评估继续。
+
+## 2026-09-09（晚）：语音管线自动化收尾
+- voice_runtime.py 修复后 ensure_voice_route 全链路可独立运行（纯 Python ADB，不依赖外部 adb）。
+- 新增 voice_audio_bridge.swift（CoreAudio 8kHz 双工桥），构建时 swiftc 编译进 App。
+- 通话钩子：dial/来电 active → ensure_voice_route + 音频桥启动；挂断 → 自动拆除。
+- CLCC 解析过滤 mode!=0 幽灵条目（EG25 挂断后固件残留），避免状态机卡死。
+- 已提交并推送 GitHub（3f7a330）。

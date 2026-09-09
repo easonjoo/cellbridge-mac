@@ -663,6 +663,14 @@ def stop_voice_route():
             _state['ready'] = False
 
 
+def invalidate():
+    """模块重启/USB 重新枚举后使路由状态失效，下次部署会完整重跑。"""
+    with _state['lock']:
+        _state['ready'] = False
+        _state['last_error'] = ''
+        _state['detail'] = ''
+
+
 def voice_status():
     installed, detail = runtime_installed()
     return {
