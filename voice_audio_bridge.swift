@@ -178,21 +178,49 @@ final class Channel {
     var outputUnit: AudioUnit?
     let label: String
     var totalFrames: UInt64 = 0
+    let scratch = RenderScratch()
 
     init(label: String) { self.label = label }
 }
 
+// MARK: - 输入渲染工具
+// HALOutput 的输入回调里 ioData 为 nil，必须自备 AudioBufferList 调 AudioUnitRender。
+final class RenderScratch {
+    var buf: UnsafeMutableRawPointer?
+    var bytes = 0
+    var lastStatus: OSStatus = 0
+
+    func ensure(_ want: Int) {
+        if buf == nil || bytes < want {
+            buf?.deallocate()
+            buf = UnsafeMutableRawPointer.allocate(byteCount: want, alignment: 16)
+            bytes = want
+        }
+    }
+
+    func render(_ unit: AudioUnit, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ bus: UInt32, _ frames: UInt32, itemSize: Int) -> UnsafeMutableRawPointer? {
+        ensure(Int(frames) * itemSize)
+        guard let p = buf else { return nil }
+        let abl = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+        defer { abl.deallocate() }
+        abl.pointee.mNumberBuffers = 1
+        abl.pointee.mBuffers.mNumberChannels = 1
+        abl.pointee.mBuffers.mDataByteSize = UInt32(Int(frames) * itemSize)
+        abl.pointee.mBuffers.mData = p
+        let st = AudioUnitRender(unit, ioActionFlags, inTimeStamp, bus, frames, abl)
+        lastStatus = st
+        return st == noErr ? p : nil
+    }
+}
+
 private func channelInputCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let ch = Unmanaged<Channel>.fromOpaque(inRefCon).takeUnretainedValue()
-    guard let ablPtr = ioData else { return -1 }
-    let status = AudioUnitRender(ch.inputUnit!, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
-    guard status == noErr else { return status }
-    let bufPtr = ablPtr.pointee.mBuffers
-    if bufPtr.mData != nil {
-        let floats = bufPtr.mData!.assumingMemoryBound(to: Float.self)
-        ch.ring.write(floats, count: Int(inNumberFrames))
-        ch.totalFrames += UInt64(inNumberFrames)
+    guard let unit = ch.inputUnit, let p = ch.scratch.render(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, itemSize: 4) else {
+        return noErr
     }
+    let floats = p.assumingMemoryBound(to: Float.self)
+    ch.ring.write(floats, count: Int(inNumberFrames))
+    ch.totalFrames += UInt64(inNumberFrames)
     return noErr
 }
 
@@ -266,6 +294,7 @@ final class FifoLink {
     let label: String
     var totalFrames: UInt64 = 0
     var droppedBytes: UInt64 = 0
+    let scratch = RenderScratch()
 
     init(label: String) { self.label = label }
 }
@@ -273,15 +302,24 @@ final class FifoLink {
 // AC 捕获 → rx FIFO（网关读=对方声音）。非阻塞写，FIFO 满则丢弃并计数。
 private func fifoCaptureCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, _ inTimeStamp: UnsafePointer<AudioTimeStamp>, _ inBusNumber: UInt32, _ inNumberFrames: UInt32, _ ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
     let link = Unmanaged<FifoLink>.fromOpaque(inRefCon).takeUnretainedValue()
-    guard let ablPtr = ioData, link.fd >= 0 else { return noErr }
-    let status = AudioUnitRender(link.unit!, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
-    guard status == noErr else { return status }
-    let bufPtr = ablPtr.pointee.mBuffers
-    guard let data = bufPtr.mData else { return noErr }
+    guard link.fd >= 0, let unit = link.unit else {
+        guardExits += 1
+        if guardExits <= 5 || guardExits % 500 == 0 {
+            FileHandle.standardError.write("[capture] guard 退出 #\(guardExits) fd=\(link.fd) unit=\(String(describing: link.unit))\n".data(using: .utf8)!)
+        }
+        return noErr
+    }
+    guard let p = link.scratch.render(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, itemSize: 2) else {
+        renderFailures += 1
+        if renderFailures <= 3 || renderFailures % 200 == 0 {
+            FileHandle.standardError.write(String(format: "[capture] AudioUnitRender 失败 #%llu status=%d frames=%u\n", renderFailures, link.scratch.lastStatus, inNumberFrames).data(using: .utf8)!)
+        }
+        return noErr
+    }
     let byteCount = Int(inNumberFrames) * 2  // s16le mono
     var written = 0
     while written < byteCount {
-        let n = write(link.fd, data + written, byteCount - written)
+        let n = write(link.fd, p + written, byteCount - written)
         if n > 0 { written += n; continue }
         if errno == EINTR { continue }
         link.droppedBytes += UInt64(byteCount - written)  // EAGAIN：网关没在取流
@@ -289,6 +327,37 @@ private func fifoCaptureCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioAction
     }
     link.totalFrames += UInt64(inNumberFrames)
     return noErr
+}
+
+var renderFailures: UInt64 = 0
+var guardExits: UInt64 = 0
+
+// 诊断：打印设备原生流格式与实际采样率
+func dumpDeviceFormat(_ device: AudioDeviceID, tag: String) {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamFormat,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: 1)
+    var asbd = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    if AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &asbd) == noErr {
+        FileHandle.standardError.write(String(format: "[%@] 输入流格式: rate=%.0f ch=%u bits=%u\n", tag, asbd.mSampleRate, asbd.mChannelsPerFrame, asbd.mBitsPerChannel).data(using: .utf8)!)
+    } else {
+        FileHandle.standardError.write("[\(tag)] 输入流格式查询失败\n".data(using: .utf8)!)
+    }
+    var ratesAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: 1)
+    var rSize: UInt32 = 0
+    if AudioObjectGetPropertyDataSize(device, &ratesAddr, 0, nil, &rSize) == noErr, rSize > 0 {
+        let count = Int(rSize) / MemoryLayout<AudioValueRange>.size
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
+        if AudioObjectGetPropertyData(device, &ratesAddr, 0, nil, &rSize, &ranges) == noErr {
+            let desc = ranges.prefix(8).map { String(format: "%.0f-%.0f", $0.mMinimum, $0.mMaximum) }.joined(separator: ", ")
+            FileHandle.standardError.write("[\(tag)] 支持采样率: \(desc)\n".data(using: .utf8)!)
+        }
+    }
 }
 
 // tx FIFO（网关写=己方声音）→ AS 播放。非阻塞读，无数据补零。
@@ -311,6 +380,7 @@ private func fifoPlaybackCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioActio
 }
 
 func runFifoMode(acDevice: AudioDeviceID, asDevice: AudioDeviceID, rxPath: String, txPath: String, verbose: Bool) {
+    dumpDeviceFormat(acDevice, tag: "AC")
     let rxLink = FifoLink(label: "cellular->fifo")
     let txLink = FifoLink(label: "fifo->cellular")
 
@@ -320,11 +390,22 @@ func runFifoMode(acDevice: AudioDeviceID, asDevice: AudioDeviceID, rxPath: Strin
         FileHandle.standardError.write("打开 tx FIFO（\(txPath)）失败：\(String(cString: strerror(errno)))\n".data(using: .utf8)!)
         exit(4)
     }
-    // 2) rx FIFO 写端：阻塞开（与网关的阻塞读端配对），后台线程等网关
+    // 2) rx FIFO 写端：非阻塞开（网关读端就绪后才成功；平时网关不读，写满即丢，绝不阻塞 IOProc）
     let rxOpen = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
-        let fd = open(rxPath, O_WRONLY)
+        var fd: Int32 = -1
+        for _ in 0..<600 {  // 最长等 120s：ENXIO=暂无读者，重试
+            fd = open(rxPath, O_WRONLY | O_NONBLOCK)
+            if fd >= 0 { break }
+            if errno == ENXIO {
+                Thread.sleep(forTimeInterval: 0.2)
+                continue
+            }
+            FileHandle.standardError.write("打开 rx FIFO 失败：\(String(cString: strerror(errno)))\n".data(using: .utf8)!)
+            break
+        }
         rxLink.fd = fd
+        FileHandle.standardError.write("[rx] FIFO 打开结果 fd=\(fd)\n".data(using: .utf8)!)
         rxOpen.signal()
     }
     FileHandle.standardError.write("等待网关打开 rx FIFO（\(rxPath)）...\n".data(using: .utf8)!)
