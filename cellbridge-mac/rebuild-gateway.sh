@@ -13,6 +13,11 @@
 #   ⑩ 短号中文短信变问号（文本模式固定 AT+CSCS="GSM"）
 #   ⑪ CallKit 唤醒了也接不通（推送 caller_uri 用了 nasIP → 127.0.0.1）
 #   ⑫ 推送报 EOF（继承了 shell 的 HTTP(S)_PROXY）
+#   ⑬ 对面先挂断时本机还在通话中：网关只做本地收线（停桥/ATH），从不给 SIP
+#      客户端发 BYE/CANCEL；且挂断事件只按 "in-"+模块 call id 查会话，呼出
+#      会话（按客户端 Call-ID 存）永远匹配不到，呼出时对方挂断等于什么都没做。
+#      → sessionForModemEvent 双方向匹配 + sendDialogTeardown 按状态发
+#        CANCEL（还在振铃）/BYE（已接通）/480（呼出未接通）。
 # 注：⑦（AT 桥上行线程被一次 EIO 杀死）在 at_pty_bridge.py 里，与网关无关。
 #
 # 修复后的源码保存在 gateway-patched/，编译前覆盖到上游源码上。

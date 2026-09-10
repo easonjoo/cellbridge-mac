@@ -120,6 +120,17 @@ func (a *ActiveCallAdapter) withActive(action func(CallID) error) error {
 
 func (a *ActiveCallAdapter) Events() <-chan ModemEvent { return a.events }
 
+// PhysicalCallID returns the modem-internal id of the call currently in
+// progress (empty when no call is up). The SIP layer records it when it sets
+// a leg up, so a later modem "ended" event can be matched back to the SIP
+// dialog it belongs to — the modem names calls by this id, while an outbound
+// SIP session is keyed by the client's own Call-ID.
+func (a *ActiveCallAdapter) PhysicalCallID() CallID {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.active
+}
+
 func (a *ActiveCallAdapter) Close() error {
 	var err error
 	a.close.Do(func() { err = a.Control.Close() })

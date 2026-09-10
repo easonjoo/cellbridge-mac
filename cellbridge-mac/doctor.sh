@@ -116,8 +116,49 @@ done
 TL=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 2>/dev/null || tailscale ip -4 2>/dev/null || true)
 [ -n "$TL" ] && printf '  tailscale: %s:5060\n' "$(printf '%s' "$TL" | head -1)"
 
+head_ "9. 通话后重挂链路（「第二通起没声音」的头号嫌疑）"
+# 蜂窝侧全零的机理：模块上 mavo-pcm-bridge 的 route session 是一次性的，
+# 每通电话结束都必须重挂。守护（route-rearm）一旦不在跑，第一通正常、
+# 之后全哑，而这从 Mac 侧进程列表上**完全看不出来**（网关、音频桥都好好的）。
+HB="$RUN/logs/route-rearm.heartbeat"
+RL="$RUN/logs/route-rearm.log"
+if [ -f "$HB" ]; then
+  AGE=$(( $(date +%s) - $(stat -f %m "$HB" 2>/dev/null || echo 0) ))
+  if [ "$AGE" -le 30 ]; then
+    ok "route-rearm 心跳正常（${AGE}s 前）"
+  else
+    bad "route-rearm 心跳停在 ${AGE}s 前 → 守护已死，第二通起蜂窝侧会全零"
+    printf '  → 拉起：pkill -f '\''[r]oute-rearm.sh'\''; nohup ./route-rearm.sh >/dev/null 2>&1 &\n'
+  fi
+else
+  bad "没有 route-rearm 心跳文件 → 守护从未启动（第二通起蜂窝侧会全零）"
+fi
+if [ -f "$RL" ]; then
+  LASTARM=$(grep -a "重挂" "$RL" | tail -1)
+  [ -n "$LASTARM" ] && printf '  · 最近一次重挂：%s\n' "$LASTARM"
+  NLOST=$(grep -ac "未见「开始」" "$RL" 2>/dev/null || true)
+  [ "${NLOST:-0}" -gt 0 ] && printf '  · 有 %s 次「未见开始事件就结束」（日志成批到达的迹象，本身不是故障）\n' "$NLOST"
+fi
+if command -v adb >/dev/null 2>&1; then
+  MB=$(adb shell pidof mavo-pcm-bridge 2>/dev/null | tr -d '\r')
+  [ -n "$MB" ] && ok "模块侧 mavo-pcm-bridge 运行中（PID=$MB）" \
+               || bad "模块侧 mavo-pcm-bridge 未运行 → 通话双向全零  → ./mavo-route.sh start"
+  # 必须按**精确 cmdline** 统计并在脚本名里夹方括号，两个理由：
+  #   ① adb shell 会额外挂一个 `sh -c sh /data/voice-route-watchdog.sh` 包装进程，
+  #      宽松匹配（*voice-route-watchdog.sh*）会多算一个 → 误报「泄漏实例」；
+  #   ② 方括号让统计命令自身的 cmdline 不匹配自己。
+  WD=$(adb shell 'c=0; for d in /proc/[0-9]*; do [ -r "$d/cmdline" ] || continue; x=$(tr "\000" " " < "$d/cmdline" 2>/dev/null); x=${x% }; case "$x" in "/bin/busybox /bin/sh /data/voice-route-watchdo[g].sh"|"/bin/sh /data/voice-route-watchdo[g].sh"|"/system/bin/sh /data/voice-route-watchdo[g].sh") c=$((c+1));; esac; done; echo $c' 2>/dev/null | tr -d '\r')
+  case "${WD:-}" in
+    ""|0) bad "模块侧语音路由 watchdog 未运行（挂断后 mixer 复位不会被补写）" ;;
+    1)    ok "模块侧语音路由 watchdog × 1" ;;
+    *)    warn "模块侧语音路由 watchdog × $WD（>1 说明有泄漏实例，重启本脚本可回收）" ;;
+  esac
+fi
+
 printf '\n\033[1m结论速查\033[0m\n'
 printf '  · 短信不通      → 看第 1、3 节\n'
 printf '  · 来电不响      → 看第 4、5 节（后台/锁屏必须靠推送）\n'
 printf '  · 接起来没声音  → 看第 2 节与 logs/audio-bridge.log\n'
+printf '  · 只有第一通有声 → 看第 9 节（重挂守护是否在跑）\n'
+printf '  · 音质发闷/半速 → 查重复 call_id（双会话抢设备），见 tests/ 回归\n'
 printf '  · 排查完把本节输出整段发我\n\n'

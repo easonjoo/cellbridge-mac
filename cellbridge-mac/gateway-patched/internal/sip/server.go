@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -108,28 +109,71 @@ func (s *Server) inboundLoop() {
 			case "incoming":
 				go s.ringClients(event)
 			case "ended":
-				go s.endInboundCall(event)
+				go s.endCallByModem(event)
 			}
 		}
 	}
 }
 
-// endInboundCall releases the session for a cellular call the network or
-// the far end already tore down. Without it the inbound session (and its
-// media port) leaked for the rest of the gateway's lifetime.
-func (s *Server) endInboundCall(event modem.ModemEvent) {
-	callID := "in-" + string(event.CallID)
-	v, ok := s.sessions.Load(callID)
-	if !ok {
+// endCallByModem releases the session for a cellular call the network or the
+// far end already tore down, in EITHER direction, and tells the SIP client
+// about it.
+//
+// Two things were wrong here (observed 2026-09-10: "对面挂断了，咱这边还在通话
+// 中"):
+//
+//   - Only inbound sessions were looked up, by "in-"+modem id. An outbound
+//     session is keyed by the client's own Call-ID, so a far-end hangup on a
+//     dialled call matched nothing: the PCM<->RTP bridge kept running on a
+//     dead cellular leg and the phone stayed "in call" until the user hung up.
+//   - Nothing was ever sent to the client. Releasing the bridge, the media
+//     port and the modem line is all local, so the client's dialog stayed open
+//     (the phone kept the call on screen indefinitely after the caller hung
+//     up).
+func (s *Server) endCallByModem(event modem.ModemEvent) {
+	sess := s.sessionForModemEvent(event)
+	if sess == nil {
 		return
 	}
-	sess, ok := v.(*SIPCallSession)
-	if !ok {
-		return
-	}
-	slog.Info("sip inbound ended by modem", "call", callID)
-	s.sessions.Delete(callID)
+	slog.Info("sip call ended by modem", "call", sess.ID, "dir", sess.Direction, "state", sess.State(), "raw", event.Raw)
+	s.sessions.Delete(sess.ID)
+	s.sendDialogTeardown(sess, "remote ended: "+event.Raw)
 	_ = sess.Hangup()
+}
+
+// sessionForModemEvent maps a modem "ended" event back to the SIP dialog it
+// belongs to. Inbound sessions are keyed "in-"+modem id, so the direct lookup
+// covers them. For everything else the modem id recorded when the leg was set
+// up is authoritative; the last resort is the single session that is actually
+// carrying audio, which covers a modem id the adapter rewrote to a logical id
+// (the HTTP dial path sets one) — V1 allows only one concurrent call, and a
+// session that is merely dialling is never picked, so a stale event left over
+// from the previous call cannot abort a call being set up.
+func (s *Server) sessionForModemEvent(event modem.ModemEvent) *SIPCallSession {
+	if v, ok := s.sessions.Load("in-" + string(event.CallID)); ok {
+		if sess, ok := v.(*SIPCallSession); ok && sess.State() != "ended" {
+			return sess
+		}
+	}
+	var byModemID, byAudio *SIPCallSession
+	s.sessions.Range(func(_, value any) bool {
+		sess, ok := value.(*SIPCallSession)
+		if !ok || sess.State() == "ended" {
+			return true
+		}
+		if id := sess.ModemCallID(); id != "" && string(id) == string(event.CallID) {
+			byModemID = sess
+			return false
+		}
+		if byAudio == nil && sess.State() == "active" {
+			byAudio = sess
+		}
+		return true
+	})
+	if byModemID != nil {
+		return byModemID
+	}
+	return byAudio
 }
 
 func (s *Server) ringClients(event modem.ModemEvent) {
@@ -145,16 +189,25 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	if callID == "in-" {
 		callID = "in-" + uuid.NewString()[:12]
 	}
-	if _, ok := s.sessions.Load(callID); ok {
-		return
-	}
 	media, err := NewMediaSession("0.0.0.0:0")
 	if err != nil {
 		return
 	}
 	sess := NewSIPCallSession(callID, peer, "inbound", s.modem, s.audio, media)
-	s.sessions.Store(callID, sess)
+	// Atomic claim: the Load guard alone cannot stop two RING events for
+	// the same modem call from both passing it before either Stores.
+	if !s.claimSession(callID, sess) {
+		_ = media.Close()
+		return
+	}
 	sent := 0
+	// Branch and From-tag of this INVITE. They are derived from the call id
+	// so that a CANCEL sent later (the far end gave up before the phone was
+	// picked up) reuses the very branch the client is showing.
+	shortID := strings.TrimPrefix(callID, "in-")
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
 	// Address the phone can actually reach back on. nasIP() only knows the
 	// tailnet (100.x) address and degrades to 127.0.0.1 without Tailscale, so
 	// the VoIP push used to advertise sip:<peer>@127.0.0.1 — YakPhone then woke
@@ -182,12 +235,29 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 				reachable = local
 			}
 			inviteSDP := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", local, local, media.LocalAddr().Port)
-			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bK%s;rport\r\nFrom: <sip:%s@%s>;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, callID[len("in-"):][:8], peer, local, callID[len("in-"):][:8], reg.Username, local, callID, local, len(inviteSDP), inviteSDP)
+			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bK%s;rport\r\nFrom: <sip:%s@%s>;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, shortID, peer, local, shortID, reg.Username, local, callID, local, len(inviteSDP), inviteSDP)
 			if _, err := s.conn.WriteToUDP([]byte(invite), remote); err != nil {
 				slog.Warn("sip inbound invite failed", "user", reg.Username, "err", err)
 				continue
 			}
 			sent++
+			// Remember where this invitation went. The far end can give up
+			// while the phone is still ringing, and the only way to stop that
+			// phone ringing is to CANCEL the INVITE — which needs the address
+			// and the exact headers of the invitation it is showing. A later
+			// pickup overwrites this with the established dialog (see
+			// acceptInbound). With several registered clients the last one
+			// invited wins; V1 runs a single phone.
+			sess.SetByePlan(byePlan{
+				remote:       remote,
+				reqURI:       contactURI(reg.Contact, remote, reg.Username),
+				from:         fmt.Sprintf("<sip:%s@%s>;tag=cb%s", peer, local, shortID),
+				to:           fmt.Sprintf("<sip:%s@%s>", reg.Username, local),
+				callID:       callID,
+				inviteCSeq:   1,
+				inviteBranch: "z9hG4bK" + shortID,
+				inviteReq:    invite,
+			})
 			slog.Info("sip inbound invite sent", "user", reg.Username, "contact", remote.String(), "call", callID, "peer", peer, "attempt", attempt+1)
 		}
 	}
@@ -208,6 +278,9 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			if _, ok := s.sessions.Load(callID); ok {
 				slog.Info("sip inbound ring timeout", "call", callID)
 				s.sessions.Delete(callID)
+				// Stop the client ringing too: without the CANCEL it keeps
+				// showing an incoming call that no longer exists.
+				s.sendDialogTeardown(sess, "ring timeout")
 				_ = sess.Hangup()
 			}
 		case <-sess.ctx.Done():
@@ -368,6 +441,19 @@ func (s *Server) acceptInbound(sess *SIPCallSession, msg string, remote *net.UDP
 	}
 	callID := sess.ID
 	s.sendACK(msg, remote, sess.Peer)
+	// The client's 200 OK carries its own To-tag and usually its Contact.
+	// Fold them into the stored dialog: the plan written when the INVITE went
+	// out describes the invitation, not the established dialog, and the BYE
+	// that ends a call the far end hung up has to address the latter.
+	plan, _ := sess.ByePlan()
+	plan.remote = remote
+	if to := parseHeader(msg, "To"); to != "" {
+		plan.to = to
+	}
+	if uri := contactURI(parseHeader(msg, "Contact"), remote, extractSIPUser(plan.to)); uri != "" {
+		plan.reqURI = uri
+	}
+	sess.SetByePlan(plan)
 	rtpTarget := inboundRTPTarget(remote, extractSDP(msg))
 	if rtpTarget != "" {
 		if err := sess.media.SetRemote(rtpTarget); err != nil {
@@ -525,6 +611,23 @@ func (s *Server) reapStaleSessions() {
 	}
 }
 
+// claimSession atomically registers sess under callID and reports whether
+// this caller won the race. It replaces the "Load guard ... Store much
+// later" pattern, which is NOT atomic: an INVITE retransmission (T1=500ms)
+// arriving inside the gap fell through the guard and created a second
+// session for the same Call-ID.
+//
+// Why that mattered (observed 2026-09-10): both sessions reached
+// voice.Bridge.Start, so two readLoops consumed the same QDC507 PCM
+// capture stream. Each reader only saw a fraction of the frames, the
+// 50-frame stats windows took ~2048ms instead of 1000ms (half rate), and
+// the caller heard garbled, stuttering audio. The loser of the race never
+// gets stored, so only the winner ever starts a bridge.
+func (s *Server) claimSession(callID string, sess *SIPCallSession) bool {
+	_, loaded := s.sessions.LoadOrStore(callID, sess)
+	return !loaded
+}
+
 // handleInvite implements §20: invite -> 100 -> modem dial -> 180 -> wait
 // cellular answer (PCM RUNNING) -> 200 OK. Retransmissions of the same
 // Call-ID answer with current state, never a second dial.
@@ -549,9 +652,9 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Type: application/sdp\r\n"
 		if rx, tx := existing.media.Stats(); rx > 0 || tx > 0 || existing.State() == "active" {
 			sdp := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", s.localIPFor(remote), s.localIPFor(remote), existing.media.LocalAddr().Port)
-			s.sendResponse(remote, msg, 200, "OK", hdrs, sdp)
+			s.sendResponseWithTag(remote, msg, 200, "OK", hdrs, sdp, existing.ToTag())
 		} else {
-			s.sendResponse(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "")
+			s.sendResponseWithTag(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "", existing.ToTag())
 		}
 		return
 	}
@@ -577,7 +680,42 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 	// Observed 2026-09-06: a probe script that sent INVITE without BYE
 	// blocked all subsequent calls.
 	s.reapStaleSessions()
+	// Pin the To-tag for this dialog. Every response we send for this INVITE
+	// carries it, and so does the BYE that ends the call: the client matches
+	// the dialog by Call-ID plus both tags, so a BYE with a fresh tag is
+	// rejected as belonging to no dialog.
+	localTag := uuid.NewString()[:8]
 	sess := NewSIPCallSession(callID, peer, "outbound", s.modem, s.audio, media)
+	sess.SetLocalTag(localTag)
+	// Capture the dialog while the client's INVITE is in hand.
+	sess.SetByePlan(byePlan{
+		remote:     remote,
+		reqURI:     contactURI(parseHeader(msg, "Contact"), remote, username),
+		from:       to + ";tag=" + localTag,
+		to:         from,
+		callID:     callID,
+		inviteCSeq: cseqNumber(parseHeader(msg, "CSeq")),
+		inviteReq:  msg,
+	})
+	// Claim the Call-ID BEFORE Dial(). Dial() rotates the QDC507 voice route
+	// and issues ATD, which takes 2-9s; the retransmission guard at the top
+	// of this function can only work once the session is in the map.
+	// Storing it only after Dial() (as upstream did) left the whole dial
+	// window open: a retransmitted INVITE created a SECOND session and a
+	// second bridge for the same call, and the two readLoops split the
+	// PCM capture stream -> half-rate, garbled audio.
+	if !s.claimSession(callID, sess) {
+		// Another handler already owns this Call-ID; answer provisionally
+		// and leave it alone (it will send its own 200 OK when answered).
+		slog.Info("sip invite duplicate suppressed", "call", callID, "peer", peer)
+		tag := ""
+		if v, ok := s.sessions.Load(callID); ok {
+			tag = v.(*SIPCallSession).ToTag()
+		}
+		s.sendResponseWithTag(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "", tag)
+		_ = media.Close()
+		return
+	}
 	// Send 180 Ringing BEFORE dialing: the modem dial path includes a
 	// per-call QDC507 route rotation (2-9s) + ATD. YakPhone shows the
 	// caller "ringing" only after it receives 180, so a late 180 made
@@ -585,27 +723,34 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 	// reboot (observed 2026-09-06: dialing→180 gap ~9s on first call).
 	// 180 is provisional and carries no SDP, so it is safe to send
 	// before the cellular leg is ready.
-	s.sendResponse(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "")
+	s.sendResponseWithTag(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "", sess.ToTag())
 	if err := sess.Dial(); err != nil {
 		slog.Warn("sip invite dial failed", "err", err)
-		s.sendResponse(remote, msg, 500, "Server Error", "", "")
+		s.sendResponseWithTag(remote, msg, 500, "Server Error", "", "", sess.ToTag())
 		s.sessions.Delete(callID)
 		_ = media.Close()
 		return
 	}
-	s.sessions.Store(callID, sess)
 	go func() {
 		answerCtx, cancel := context.WithTimeout(context.Background(), answerTimeout)
 		defer cancel()
 		if err := sess.AwaitBridge(answerCtx); err != nil {
 			slog.Warn("sip await bridge failed", "call", callID, "err", err)
+			// Answer the client's INVITE even though the call never came up:
+			// it was given a 180 and otherwise rings until its own
+			// transaction timer expires (64s) for a call that is already dead.
+			// A teardown triggered by the modem answers instead and leaves the
+			// dialog to that path.
+			if _, live := s.sessions.Load(callID); live {
+				s.sendResponseWithTag(remote, msg, 480, "Temporarily Unavailable", "", "", sess.ToTag())
+			}
 			_ = sess.Hangup()
 			s.sessions.Delete(callID)
 			return
 		}
 		sdp := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", s.localIPFor(remote), s.localIPFor(remote), media.LocalAddr().Port)
 		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Type: application/sdp\r\n"
-		s.sendResponse(remote, msg, 200, "OK", hdrs, sdp)
+		s.sendResponseWithTag(remote, msg, 200, "OK", hdrs, sdp, sess.ToTag())
 		slog.Info("sip invite handled", "call", callID, "peer", peer, "rtp_remote", fmt.Sprintf("%s:%d", rtpIP, rtpPort))
 	}()
 }
@@ -705,17 +850,124 @@ func privateLANIP() string {
 }
 
 func (s *Server) sendResponse(remote *net.UDPAddr, req string, code int, reason, extraHeaders, body string) {
+	s.sendResponseWithTag(remote, req, code, reason, extraHeaders, body, "")
+}
+
+// sendResponseWithTag is sendResponse with an explicit To-tag. A dialog's tag
+// must be identical in the provisional and the final response to the same
+// INVITE, and the BYE that later ends the call has to carry that very tag, so
+// the response path pins one instead of minting a fresh tag per message.
+func (s *Server) sendResponseWithTag(remote *net.UDPAddr, req string, code int, reason, extraHeaders, body, tag string) {
+	resp := buildResponse(req, code, reason, extraHeaders, body, tag)
+	if _, err := s.conn.WriteToUDP([]byte(resp), remote); err != nil {
+		slog.Warn("sip response failed", "code", code, "err", err)
+	}
+}
+
+// buildResponse renders a SIP response to req. An empty tag mints a fresh
+// one; a request whose To header already carries a tag keeps it.
+func buildResponse(req string, code int, reason, extraHeaders, body, tag string) string {
 	callID := parseHeader(req, "Call-ID")
 	from := parseHeader(req, "From")
 	to := parseHeader(req, "To")
 	via := parseHeader(req, "Via")
 	cseq := parseHeader(req, "CSeq")
-	tag := ";tag=" + uuid.NewString()[:8]
+	if tag == "" {
+		tag = ";tag=" + uuid.NewString()[:8]
+	}
 	if strings.Contains(to, "tag=") {
 		tag = ""
 	}
-	resp := fmt.Sprintf("SIP/2.0 %d %s\r\nVia: %s\r\nFrom: %s\r\nTo: %s%s\r\nCall-ID: %s\r\nCSeq: %s\r\n%sContent-Length: %d\r\n\r\n%s", code, reason, via, from, to, tag, callID, cseq, extraHeaders, len(body), body)
-	_, _ = s.conn.WriteToUDP([]byte(resp), remote)
+	return fmt.Sprintf("SIP/2.0 %d %s\r\nVia: %s\r\nFrom: %s\r\nTo: %s%s\r\nCall-ID: %s\r\nCSeq: %s\r\n%sContent-Length: %d\r\n\r\n%s", code, reason, via, from, to, tag, callID, cseq, extraHeaders, len(body), body)
+}
+
+// sendDialogTeardown tells the SIP client that a call the modem has already
+// released is over. Nothing else in this gateway ever sends a BYE, so a
+// far-end hangup used to leave the client's dialog open forever: the phone
+// stayed "in call" although the audio had stopped.
+func (s *Server) sendDialogTeardown(sess *SIPCallSession, reason string) {
+	plan, ok := sess.ByePlan()
+	if !ok {
+		return
+	}
+	method, message := teardownMessage(sess.Direction, sess.State(), sess.LocalTag(), plan, s.localIPFor(plan.remote))
+	if message == "" {
+		return
+	}
+	if _, err := s.conn.WriteToUDP([]byte(message), plan.remote); err != nil {
+		slog.Warn("sip teardown failed", "call", sess.ID, "method", method, "err", err)
+		return
+	}
+	slog.Info("sip teardown sent", "call", sess.ID, "method", method, "reason", reason, "remote", plan.remote.String())
+}
+
+// teardownMessage builds the SIP message that ends a call at the client, or
+// "" when this dialog is past notifying. It depends on no Server state so the
+// exact bytes can be asserted offline.
+//
+// Which message is correct depends on how far the call got:
+//
+//   - client still being rung (inbound INVITE unanswered) -> CANCEL, the only
+//     way to silence a phone ringing for a call the far end has abandoned;
+//   - connected -> BYE, which closes the dialog and clears the call screen;
+//   - dialled out but never answered -> a final 480, so the client gives up
+//     instead of ringing until its own transaction timer expires.
+func teardownMessage(direction, state, localTag string, plan byePlan, localIP string) (string, string) {
+	if plan.remote == nil || plan.callID == "" {
+		return "", ""
+	}
+	switch {
+	case direction == "inbound" && state == "init":
+		// No dialog exists yet. CANCEL must reuse the INVITE's Via branch
+		// and CSeq number, otherwise the client cannot match it to the
+		// invitation it is showing.
+		msg := fmt.Sprintf("CANCEL %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %d CANCEL\r\nContent-Length: 0\r\n\r\n",
+			plan.reqURI, localIP, plan.inviteBranch, plan.from, plan.to, plan.callID, plan.inviteCSeq)
+		return "CANCEL", msg
+	case state == "init" || state == "dialing":
+		if plan.inviteReq == "" {
+			return "", ""
+		}
+		return "480", buildResponse(plan.inviteReq, 480, "Temporarily Unavailable", "", "", ";tag="+localTag)
+	default:
+		// BYE opens a new transaction, so it needs its own branch, and a
+		// CSeq number higher than anything the client has sent.
+		msg := fmt.Sprintf("BYE %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bK%s;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %d BYE\r\nContent-Length: 0\r\n\r\n",
+			plan.reqURI, localIP, uuid.NewString()[:12], plan.from, plan.to, plan.callID, plan.inviteCSeq+1)
+		return "BYE", msg
+	}
+}
+
+// contactURI turns a Contact header value into a Request-URI for a request we
+// originate (BYE/CANCEL). Falls back to the packet's source address when the
+// client sent no usable Contact, so the teardown is never silently dropped.
+func contactURI(contact string, remote *net.UDPAddr, user string) string {
+	if i := strings.Index(contact, "sip:"); i >= 0 {
+		rest := contact[i:]
+		if j := strings.IndexAny(rest, ">;"); j >= 0 {
+			rest = rest[:j]
+		}
+		if rest = strings.TrimSpace(rest); rest != "" {
+			return rest
+		}
+	}
+	if remote == nil {
+		return ""
+	}
+	return fmt.Sprintf("sip:%s@%s", user, remote.String())
+}
+
+// cseqNumber reads the sequence number out of a "CSeq: <n> <METHOD>" header.
+func cseqNumber(cseq string) int {
+	fields := strings.Fields(cseq)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func extractSIPUser(hdr string) string {

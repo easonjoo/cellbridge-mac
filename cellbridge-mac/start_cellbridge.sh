@@ -38,6 +38,14 @@ if [ -z "$PY" ] || [ ! -x "$PY" ]; then
 fi
 "$PY" -c "import usb.core" >/dev/null 2>&1 \
   || echo "警告：$PY 缺少 pyusb，AT 桥会失败。安装：$PY -m pip install --user pyusb"
+
+# 解析 JSON（tailscale status）用的解释器：只用标准库 json，随便哪个 python3 都行。
+# 不要硬编码 /usr/bin/python3 —— 没装 Xcode CLT 的机器上它可能不存在，
+# 而失败是**静默**的（探测不到 tailnet → 退化成纯局域网，用户以为"远程坏了"）。
+PY3=""
+for cand in "$PY" "$(command -v python3 2>/dev/null)" /usr/bin/python3; do
+  [ -n "$cand" ] && [ -x "$cand" ] && PY3="$cand" && break
+done
 APP_PY="$DIR/at_pty_bridge.py"
 BRIDGE="$DIR/voice-audio-bridge"
 GATEWAY="$DIR/cellbridge-gateway"
@@ -75,13 +83,38 @@ kill_remote_watchdog() {
 }
 
 if [ "${1:-}" = "stop" ]; then
-  for pat in "cellbridge-gateway" "voice-audio-bridge" "at_pty_bridge.py"; do
+  # 注意 "[r]oute-rearm.sh" 的方括号写法：pkill -f 匹配整条命令行，
+  # 若写成 "route-rearm.sh"，执行本脚本的 shell 自身 cmdline 也会命中而被杀。
+  for pat in "cellbridge-gateway" "voice-audio-bridge" "at_pty_bridge.py" "[r]oute-rearm.sh"; do
     pkill -f "$pat" 2>/dev/null && echo "已停止 $pat"
   done
   KILLED="$(kill_remote_watchdog)"
   [ -n "${KILLED:-}" ] && [ "$KILLED" != "0" ] && echo "已清理模块侧 watchdog 实例 × $KILLED"
   exit 0
 fi
+
+# --- 前置检查（放在最前：组件缺失时不该先白折腾一遍模块）---
+for f in "$APP_PY" "$BRIDGE" "$GATEWAY"; do
+  if [ ! -f "$f" ]; then
+    echo "缺少组件: $f"; echo "请先运行构建（见 README-mac.md）"; exit 1
+  fi
+done
+
+# App 占用 USB AT 接口，必须先退出
+if pgrep -f "DJiPhone Kit.app" >/dev/null 2>&1; then
+  echo "DJiPhone Kit App 正在运行（占用 USB AT 接口），先退出它..."
+  pkill -f "DJiPhone Kit.app" 2>/dev/null
+  sleep 2
+fi
+
+# --- 清理旧实例 ---
+# ⚠️ 本段必须留在「启动任何组件」之前。stop 分支里含 `pkill -f "[r]oute-rearm.sh"`，
+# 历史实现把它放在 watchdog / rearm 启动之后，于是**每次启动都会把刚拉起的 rearm
+# 杀掉**；而那时的存活检查在 kill 之前跑，横幅照样打印「通话后自动重挂路由会话
+# 已启用」——守护实际已死。后果是此后每通电话结束都不重挂，表现为
+# 「重启后第一通正常、之后全哑」，且重启服务也修不好（因为又被杀一遍）。
+"$0" stop >/dev/null 2>&1
+sleep 1
 
 # --- 语音路由（01.001.02.004 固件，会话类型含 CSVoice/VoLTE/VoiceMMode）---
 # 模块重启后 mixer 复位，每次启动时重新写入；mini_tinymix 由 module-tools 交叉编译
@@ -103,7 +136,11 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
   # mavo-pcm-bridge：DSP VoLTE ↔ UAC/USB 的用户态桥（缺它则通话全零静音）。
   # 注意：必须用 pidof 精确匹配（pgrep -f 会自匹配 adb shell 命令行造成假阳性）；
   # 二进制用 nohup 启动可在 adb shell 退出后存活。
-  adb shell 'pidof mavo-pcm-bridge >/dev/null || { [ -x /data/mavo-pcm-bridge ] && nohup /data/mavo-pcm-bridge --verbose --voice-route-session > /data/mavo-bridge.log 2>&1 & sleep 2; }' 2>/dev/null
+  #
+  # 实测（2026-09-10）：该桥的 --voice-route-session 只对「第一通」电话生效，
+  # 之后 DSP 不再往 hw:0,4 送数据 → 蜂窝侧全零、双向哑。故启动时必须**强制
+  # 重挂**（旧实现「已在跑就跳过」，导致重启整套服务也修不好第二通）。
+  "$DIR/mavo-route.sh" start 2>/dev/null | sed 's/^/    /' || true
   adb shell 'pidof mavo-pcm-bridge >/dev/null && echo "    mavo-pcm-bridge 运行中" || echo "    警告：mavo-pcm-bridge 未运行"' 2>/dev/null
   # 部署路由自愈脚本到模块（每次覆盖写入，保证内容升级能生效）
   #
@@ -163,27 +200,43 @@ chmod +x /data/voice-route-watchdog.sh' 2>/dev/null
   else
     echo "    警告：watchdog 未启动（通话挂断后语音路由可能不被修复）"
   fi
+  # 通话结束后重挂模块侧 VoLTE 路由会话（mavo-pcm-bridge 的 route session
+  # 是一次性的：不重挂则第二通起蜂窝侧全零静音）。详见 route-rearm.sh。
+  # 方括号写法与 stop 分支同理：pkill -f 匹配整条命令行，裸写
+  # "route-rearm.sh" 会把「命令行里恰好含这个字符串」的调用者（例如
+  # 在终端里执行 ./start_cellbridge.sh 的那个 shell）一起杀掉。
+  # ⚠️ 两个必做的等待，都是踩过的坑：
+  #   ① pkill 之后必须**等旧实例真正退出**再启动新的。新实例一启动就去抢
+  #      单例锁（route-rearm.lock），此时旧实例若还没被回收，它会判定
+  #      「已有实例在运行」直接 exit —— 新旧都没了，表现是「重启完 rearm
+  #      反而不在跑」。窗口虽小，但在慢机器/沙箱里实测会命中。
+  #   ② 存活判据必须是**心跳文件**而不是 pgrep：进程在 ≠ 循环在转，
+  #      本项目已被「进程看着在、实际没干活」误导过多次。
+  pkill -f "[r]oute-rearm.sh" 2>/dev/null
+  i=0
+  while [ "$i" -lt 24 ]; do
+    pgrep -f "[r]oute-rearm.sh" > /dev/null 2>&1 || break
+    sleep 0.25
+    i=$((i + 1))
+  done
+  HB="$RUN/logs/route-rearm.heartbeat"
+  rm -f "$HB"
+  nohup "$DIR/route-rearm.sh" > /dev/null 2>&1 &
+  i=0
+  while [ "$i" -lt 20 ]; do
+    sleep 0.5
+    [ -f "$HB" ] && break
+    i=$((i + 1))
+  done
+  if [ -f "$HB" ]; then
+    echo "    通话后自动重挂路由会话 已启用（心跳正常，日志 route-rearm.log）"
+  else
+    echo "    警告：route-rearm 心跳未出现（第二通起可能无蜂窝音频）"
+    echo "          排查：tail -20 $RUN/logs/route-rearm.log"
+  fi
 else
   echo "    警告：找不到 adb，跳过 CS 路由写入"
 fi
-
-# --- 前置检查 ---
-for f in "$APP_PY" "$BRIDGE" "$GATEWAY"; do
-  if [ ! -f "$f" ]; then
-    echo "缺少组件: $f"; echo "请先运行构建（见 README-mac.md）"; exit 1
-  fi
-done
-
-# App 占用 USB AT 接口，必须先退出
-if pgrep -f "DJiPhone Kit.app" >/dev/null 2>&1; then
-  echo "DJiPhone Kit App 正在运行（占用 USB AT 接口），先退出它..."
-  pkill -f "DJiPhone Kit.app" 2>/dev/null
-  sleep 2
-fi
-
-# 清理旧实例
-"$0" stop >/dev/null 2>&1
-sleep 1
 
 # --- FIFO ---
 RX_FIFO="$RUN/cellular-rx.fifo"
@@ -194,10 +247,18 @@ mkfifo "$RX_FIFO" "$TX_FIFO"
 # --- 组件 1：AT PTY 桥 ---
 echo "[1/3] 启动 AT PTY 桥..."
 "$PY" "$APP_PY" > "$RUN/pty_path.txt" 2> "$LOG/at-pty.log" &
-sleep 4
-TTY_PATH=$(head -1 "$RUN/pty_path.txt" 2>/dev/null)
+# 轮询等串口路径出现，而不是固定 sleep：正常 1~2s 就有，慢机器最多等 15s。
+# 固定等待两头不讨好 —— 快机器上白等，慢机器（或沙箱里）又不够。
+TTY_PATH=""
+i=0
+while [ "$i" -lt 30 ]; do
+  sleep 0.5
+  TTY_PATH=$(head -1 "$RUN/pty_path.txt" 2>/dev/null)
+  [ -n "$TTY_PATH" ] && break
+  i=$((i + 1))
+done
 if [ -z "$TTY_PATH" ]; then
-  echo "AT PTY 桥未输出串口路径，查看 $LOG/at-pty.log"; exit 1
+  echo "AT PTY 桥未输出串口路径（等待 15s），查看 $LOG/at-pty.log"; exit 1
 fi
 echo "    模块串口: $TTY_PATH"
 
@@ -232,6 +293,41 @@ if [ -z "$PUSH_TOKEN" ] && [ -f "$PUSH_TOKEN_FILE" ]; then
   PUSH_TOKEN="$(tr -d '[:space:]' < "$PUSH_TOKEN_FILE")"
 fi
 
+# --- 组网信息（Tailscale 可选，装了就自动启用外网访问）---
+# 有 Tailscale 时把 MagicDNS 名写进 network.tailnet_hostname：配对接口据此
+# 返回 baseURL=https://<名字>.ts.net，手机 App 才能从局域网外接入（详见
+# ./tailnet-setup.sh）。没装则留空 —— 配置校验只要求它为空或 *.ts.net。
+TS_CLI=""
+for c in \
+  "$(command -v tailscale 2>/dev/null || true)" \
+  /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+  /usr/local/bin/tailscale \
+  /opt/homebrew/bin/tailscale
+do
+  [ -n "$c" ] && [ -x "$c" ] && TS_CLI="$c" && break
+done
+TAILNET_IP=""; TAILNET_NAME=""
+if [ -n "$TS_CLI" ]; then
+  _ts=$(printf '%s' "$("$TS_CLI" status --json 2>/dev/null)" | "$PY3" -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ips=(d.get("Self") or {}).get("TailscaleIPs") or []
+print(next((i for i in ips if ":" not in i), ""))
+print(((d.get("Self") or {}).get("DNSName") or "").rstrip("."))
+' 2>/dev/null)
+  TAILNET_IP=$(printf '%s\n' "$_ts" | sed -n '1p')
+  TAILNET_NAME=$(printf '%s\n' "$_ts" | sed -n '2p')
+fi
+# 校验要求 *.ts.net，否则网关会拒绝启动，这里直接拦掉
+case "$TAILNET_NAME" in
+  *.ts.net) TAILNET_LINE="  tailnet_hostname: $TAILNET_NAME" ;;
+  *) TAILNET_NAME=""; TAILNET_LINE="" ;;
+esac
+LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+
 echo "[3/3] 启动 CellBridge 网关... (SMS_DRY_RUN=$CELLBRIDGE_SMS_DRY_RUN)"
 if [ -n "$PUSH_TOKEN" ]; then
   echo "    PushKit token: 已配置（${#PUSH_TOKEN} 字符）→ 来电可唤醒 CallKit"
@@ -244,6 +340,7 @@ cat > "$RUN/config.yaml" << EOF
 network:
   mode: tailnet
   transport: tailnet
+$TAILNET_LINE
 server:
   listen: 127.0.0.1:8787
 data:
@@ -273,10 +370,22 @@ EOF
 "$GATEWAY" -config "$RUN/config.yaml" > "$LOG/gateway.log" 2>&1 &
 GWPID=$!
 
-sleep 6
+# 就绪判据 = 进程活着 **且** health 接口应答。固定 sleep 6 有两个盲区：
+# 快机器上白等，慢机器上「进程在、接口还没起来」就被当成成功了。
+i=0
+READY=0
+while [ "$i" -lt 40 ]; do
+  sleep 0.5
+  kill -0 $GWPID 2>/dev/null || break
+  if curl -s -m 1 --noproxy '*' http://127.0.0.1:8787/api/v1/health 2>/dev/null | grep -q '"status":"ok"'; then
+    READY=1; break
+  fi
+  i=$((i + 1))
+done
 if ! kill -0 $GWPID 2>/dev/null; then
   echo "网关启动失败，日志："; tail -20 "$LOG/gateway.log"; exit 1
 fi
+[ "$READY" = "1" ] || echo "    警告：网关进程在，但 health 接口 20s 内未就绪（可能仍在初始化，或 8787 被占用）"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -287,7 +396,13 @@ echo "   控制台:  http://127.0.0.1:8787"
 echo "   日志:    $LOG/"
 echo "═══════════════════════════════════════════════"
 echo "iPhone 端（YakPhone 等 SIP 客户端）："
-echo "   服务器 = Mac 的局域网 IP 或 Tailscale 地址:5060"
+if [ -n "$TAILNET_IP" ]; then
+  echo "   服务器 = $TAILNET_IP:5060（Tailscale，外网/蜂窝网可用）"
+  [ -n "$LAN_IP" ] && echo "           或 $LAN_IP:5060（同一局域网）"
+else
+  echo "   服务器 = ${LAN_IP:-<Mac 的 IP>}:5060（仅同一局域网）"
+  echo "   想在外网使用：安装 Tailscale 后跑 ./tailnet-setup.sh serve"
+fi
 echo "   用户名/密码如上。停止：./start_cellbridge.sh stop"
 echo ""
 trap 'echo "停止全部组件..."; "$0" stop' INT TERM

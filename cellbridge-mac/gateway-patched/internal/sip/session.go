@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -23,6 +24,38 @@ type SIPCallSession struct {
 	cancel    context.CancelFunc
 	mu        sync.Mutex
 	state     string
+	// localTag is the To-tag this gateway puts on the responses to an
+	// outbound INVITE. A dialog's tag must be identical in the provisional
+	// and the final response, and the BYE that later ends the call has to
+	// carry exactly this tag or the client rejects it as a foreign dialog.
+	localTag string
+	// modemID is the modem-internal id of the cellular leg, recorded when
+	// that leg is set up. Modem "ended" events name that id, so matching on
+	// it is what lets a far-end hangup find the right SIP dialog: an
+	// outbound session is keyed by the client's Call-ID, which the modem has
+	// never heard of.
+	modemID modem.CallID
+	bye     byePlan
+	hasBye  bool
+}
+
+// byePlan is everything needed to end an established dialog from our side —
+// and, while a call is still ringing, to cancel the pending INVITE.
+//
+// It is captured from the SIP messages that created the dialog rather than
+// rebuilt later, because every field has to match byte-for-byte what the
+// client saw: the tags identify the dialog, the CSeq has to be higher than
+// the last request the client sent, and a CANCEL is only accepted when it
+// reuses the INVITE's Via branch and CSeq number.
+type byePlan struct {
+	remote       *net.UDPAddr // where to send the teardown
+	reqURI       string       // Request-URI: the client's Contact
+	from         string       // our From header, carrying our tag
+	to           string       // the peer's From/To header, carrying its tag
+	callID       string
+	inviteCSeq   int    // CSeq number of the INVITE that opened the dialog
+	inviteBranch string // Via branch of that INVITE (CANCEL must reuse it)
+	inviteReq    string // the raw INVITE, needed to answer it with an error
 }
 
 func NewSIPCallSession(id, peer, dir string, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio, media *MediaSession) *SIPCallSession {
@@ -75,6 +108,10 @@ func (s *SIPCallSession) Dial() error {
 		if err := s.modem.Dial(dialCtx, s.Peer); err != nil {
 			return fmt.Errorf("modem dial failed: %w", err)
 		}
+		// Remember which cellular leg this dialog owns. The modem names the
+		// call by this id when it later reports it ended, and that is the
+		// only link back to a SIP session keyed by the client's Call-ID.
+		s.SetModemCallID(s.modem.PhysicalCallID())
 	}
 	return nil
 }
@@ -134,6 +171,7 @@ func (s *SIPCallSession) AnswerInbound(ctx context.Context) error {
 	if err := s.modem.Answer(ctx); err != nil {
 		return fmt.Errorf("modem answer failed: %w", err)
 	}
+	s.SetModemCallID(s.modem.PhysicalCallID())
 	waitCtx, waitCancel := context.WithTimeout(s.ctx, inboundActiveWait)
 	defer waitCancel()
 	// An answered inbound call is reported with +CLCC dir=1. The shared
@@ -177,3 +215,56 @@ func (s *SIPCallSession) Hangup() error {
 }
 
 func (s *SIPCallSession) State() string { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
+
+// SetLocalTag records the To-tag used in this gateway's responses, so every
+// later response (and the BYE) can reuse it instead of minting a new one.
+func (s *SIPCallSession) SetLocalTag(tag string) {
+	s.mu.Lock()
+	s.localTag = tag
+	s.mu.Unlock()
+}
+
+func (s *SIPCallSession) LocalTag() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.localTag
+}
+
+// ToTag returns the ";tag=..." fragment this dialog's responses must carry,
+// or "" when no tag has been pinned yet (the caller then mints one).
+func (s *SIPCallSession) ToTag() string {
+	tag := s.LocalTag()
+	if tag == "" {
+		return ""
+	}
+	return ";tag=" + tag
+}
+
+// SetModemCallID records which cellular leg this dialog is talking over.
+func (s *SIPCallSession) SetModemCallID(id modem.CallID) {
+	s.mu.Lock()
+	s.modemID = id
+	s.mu.Unlock()
+}
+
+func (s *SIPCallSession) ModemCallID() modem.CallID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.modemID
+}
+
+// SetByePlan stores the dialog state captured while the call was set up.
+func (s *SIPCallSession) SetByePlan(plan byePlan) {
+	s.mu.Lock()
+	s.bye = plan
+	s.hasBye = true
+	s.mu.Unlock()
+}
+
+// ByePlan reports the stored dialog state. The second result is false for a
+// session that never got far enough to have a dialog to end.
+func (s *SIPCallSession) ByePlan() (byePlan, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bye, s.hasBye
+}

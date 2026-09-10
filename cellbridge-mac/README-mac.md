@@ -309,6 +309,15 @@ YakPhone 本身。
 | # | 位置 | 症状 | 原因 |
 |---|---|---|---|
 | ⑪ | `internal/sip/server.go` `ringClients()` | CallKit 唤醒了也接不通 | 推送里的 `caller_uri` 用 `nasIP()`，本机无 Tailscale 时是 `127.0.0.1`，YakPhone 拿到的呼叫地址指向它自己 |
+| ⑬ | `internal/sip/server.go` `endInboundCall()` | **对方先挂断，手机界面还停在通话中** | 两个独立的洞：① 会话查找只按 `"in-"+模块call id`，呼出会话以客户端 Call-ID 为键 → 呼出时对方挂断等于空操作；② 全网关**从不发 BYE/CANCEL**，收线只做本地动作（停桥/关媒体/ATH），客户端对话永远不关 |
+
+**⑬ 的修法**：建对话时把 Request-URI / From / To / Call-ID / CSeq / Via branch 原样记进
+`byePlan`（呼出取客户端 INVITE，呼入取我们发出的 INVITE、接听后用 200 OK 覆盖）；
+`sessionForModemEvent` 三级匹配（`"in-"+id` → 建腿时记下的模块 call id → 唯一在跑音频的
+`active` 会话）；`sendDialogTeardown` 按状态发 **CANCEL**（还在振铃，复用 INVITE 的
+branch 与 CSeq 号）/ **BYE**（已接通）/ **480**（呼出未接通，否则手机白响到事务超时）。
+排查用：`grep -E "sip (call ended by modem|teardown sent|bye received)" ~/.cellbridge/run/logs/gateway.log`
+—— 看到 `sip bye received` 是**手机自己**挂断，不算这条链路被验证。
 
 修复内容：
 
