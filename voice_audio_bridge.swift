@@ -294,6 +294,9 @@ final class FifoLink {
     let label: String
     var totalFrames: UInt64 = 0
     var droppedBytes: UInt64 = 0
+    // 上次成功把数据写进 rx FIFO 的时刻。写入成功 ⇔ 网关正在取流 ⇔ 通话进行中；
+    // EAGAIN（计入 droppedBytes）⇔ 网关没在取流 ⇔ 空闲。空闲挂起靠它判定。
+    var lastDrainAt: CFAbsoluteTime = 0
     let scratch = RenderScratch()
 
     init(label: String) { self.label = label }
@@ -325,6 +328,7 @@ private func fifoCaptureCallback(_ inRefCon: UnsafeMutableRawPointer, _ ioAction
         link.droppedBytes += UInt64(byteCount - written)  // EAGAIN：网关没在取流
         break
     }
+    if written > 0 { link.lastDrainAt = CFAbsoluteTimeGetCurrent() }  // 网关在取流 → 通话中
     link.totalFrames += UInt64(inNumberFrames)
     return noErr
 }
@@ -433,21 +437,91 @@ func runFifoMode(acDevice: AudioDeviceID, asDevice: AudioDeviceID, rxPath: Strin
         FileHandle.standardError.write("AudioUnit 配置失败（FIFO 模式）\n".data(using: .utf8)!)
         exit(3)
     }
-    guard AudioOutputUnitStart(riu) == noErr, AudioOutputUnitStart(tou) == noErr else {
+    func startUnits() -> Bool {
+        let r = AudioOutputUnitStart(riu)
+        let t = AudioOutputUnitStart(tou)
+        return r == noErr && t == noErr
+    }
+    func stopUnits() {
+        _ = AudioOutputUnitStop(riu)
+        _ = AudioOutputUnitStop(tou)
+    }
+    // 挂起期间网关若已开始写，tx FIFO 里会积压若干帧；恢复前丢弃，
+    // 避免把陈旧音频播出去造成可感知的通话延迟。
+    func drainTxFifo() {
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = buf.withUnsafeMutableBytes { read(txLink.fd, $0.baseAddress!, 4096) }
+            if n <= 0 { break }
+        }
+    }
+
+    guard startUnits() else {
         FileHandle.standardError.write("AudioUnit 启动失败（FIFO 模式）\n".data(using: .utf8)!)
         exit(3)
     }
 
     FileHandle.standardError.write("voice-audio-bridge FIFO 模式运行中：AC Interface→\(rxPath)，\(txPath)→AS Interface（s16le 8k mono）\n".data(using: .utf8)!)
 
+    // ── 空闲挂起（散热优化）────────────────────────────────────────────
+    // 空闲时两个 AudioUnit 仍以 ~8000 fr/s 双向全速搬运（日志 [stats] 可见），
+    // 模块的 UAC 端点因此被 USB 主机持续轮询、无法进入低功耗，是长期值守
+    // 的主要热源之一。这里在无通话时停掉 AudioUnit，通话建立时自动唤醒：
+    //   空闲判据  网关不读 rx FIFO → capture 写 EAGAIN（droppedBytes 增长）
+    //   唤醒信号  网关每 20ms 往 tx FIFO 写一帧（bridge.go 空闲补静音），
+    //             故 poll(txLink.fd) 有数据即代表通话已建立
+    // CB_AUDIO_IDLE_SUSPEND=0 关闭本特性；CB_AUDIO_IDLE_SECONDS 调空闲阈值。
+    let env = ProcessInfo.processInfo.environment
+    var idleSuspend = env["CB_AUDIO_IDLE_SUSPEND"] != "0"
+    let idleSeconds = Double(env["CB_AUDIO_IDLE_SECONDS"] ?? "") ?? 10.0
+    let minRunSeconds = 3.0   // 恢复后至少运行这么久，避免边界抖动
+
+    var unitsRunning = true
+    var lastDrain = CFAbsoluteTimeGetCurrent()
+    var lastResume = CFAbsoluteTimeGetCurrent()
+    var suspendCount = 0
     var lastRx: UInt64 = 0, lastTx: UInt64 = 0, lastDrop: UInt64 = 0
+    var lastStats = CFAbsoluteTimeGetCurrent()
+
     while !interrupted {
-        Thread.sleep(forTimeInterval: 5)
-        if verbose {
-            let r = rxLink.totalFrames, t = txLink.totalFrames, dp = rxLink.droppedBytes
-            FileHandle.standardError.write(String(format: "[stats] cellular->fifo=%llu fr (%llu fr/s) fifo->cellular=%llu fr (%llu fr/s) dropped=%llu B\n", r - lastRx, (r - lastRx) / 5, t - lastTx, (t - lastTx) / 5, dp - lastDrop).data(using: .utf8)!)
+        let now = CFAbsoluteTimeGetCurrent()
+
+        if unitsRunning {
+            if rxLink.lastDrainAt > lastDrain { lastDrain = rxLink.lastDrainAt }
+            if idleSuspend, now - lastDrain > idleSeconds, now - lastResume > minRunSeconds {
+                stopUnits()
+                unitsRunning = false
+                suspendCount += 1
+                FileHandle.standardError.write(String(format: "[idle] 第 %d 次暂停 AudioUnit（已空闲 %.0fs，等待通话音频唤醒）\n", suspendCount, idleSeconds).data(using: .utf8)!)
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        } else {
+            // 阻塞等待 tx FIFO 出现数据；500ms 超时以便及时响应退出信号
+            var pfd = pollfd(fd: txLink.fd, events: Int16(POLLIN), revents: 0)
+            let pr = poll(&pfd, 1, 500)
+            if pr > 0 && (pfd.revents & Int16(POLLIN)) != 0 {
+                drainTxFifo()
+                if startUnits() {
+                    unitsRunning = true
+                    lastResume = now
+                    lastDrain = now
+                    FileHandle.standardError.write("[idle] 检测到通话音频，AudioUnit 已恢复\n".data(using: .utf8)!)
+                } else {
+                    // 恢复失败：永久退回常开模式，绝不牺牲通话能力
+                    idleSuspend = false
+                    FileHandle.standardError.write("[idle] AudioUnit 恢复失败，退回常开模式（不再挂起）\n".data(using: .utf8)!)
+                }
+            }
         }
-        lastRx = rxLink.totalFrames; lastTx = txLink.totalFrames; lastDrop = rxLink.droppedBytes
+
+        // 统计：每 5 秒一次（挂起时也打印，便于确认真的停了）
+        if verbose, now - lastStats >= 5 {
+            let r = rxLink.totalFrames, t = txLink.totalFrames, dp = rxLink.droppedBytes
+            let tag = unitsRunning ? "" : " [已挂起]"
+            FileHandle.standardError.write(String(format: "[stats]%@ cellular->fifo=%llu fr fifo->cellular=%llu fr dropped=%llu B\n", tag, r - lastRx, t - lastTx, dp - lastDrop).data(using: .utf8)!)
+            lastRx = r; lastTx = t; lastDrop = dp
+            lastStats = now
+        }
     }
 
     if let iu = rxLink.unit { AudioOutputUnitStop(iu); AudioUnitUninitialize(iu) }

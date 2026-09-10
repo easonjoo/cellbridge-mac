@@ -242,8 +242,21 @@ func main() {
 		}
 		application.SetCapabilities(capabilities)
 		application.SMSEngine = sms.NewEngine(database, serialAdapter)
+		// 短信收件箱靠轮询（本模块未启用 AT+CNMI URC 上报），每轮发
+		// AT+CPMS + AT+CMGL 两条命令唤醒模块基带。长期值守下这是持续的
+		// 微小热源，故做成可调：CELLBRIDGE_SMS_POLL_INTERVAL=30s 可显著
+		// 降频（代价是短信最多延迟该时长）。默认保持 5s，行为不变。
+		smsPollInterval := 5 * time.Second
+		if raw := strings.TrimSpace(os.Getenv("CELLBRIDGE_SMS_POLL_INTERVAL")); raw != "" {
+			if parsed, parseErr := time.ParseDuration(raw); parseErr == nil && parsed > 0 {
+				smsPollInterval = parsed
+			} else {
+				slog.Warn("invalid CELLBRIDGE_SMS_POLL_INTERVAL, keeping default", "value", raw, "default", smsPollInterval)
+			}
+		}
+		slog.Info("SMS inbox poll interval", "interval", smsPollInterval)
 		go func() {
-			if runErr := application.SMSEngine.Run(shutdownContext, 5*time.Second, application.HandleMessage); runErr != nil && runErr != context.Canceled {
+			if runErr := application.SMSEngine.Run(shutdownContext, smsPollInterval, application.HandleMessage); runErr != nil && runErr != context.Canceled {
 				slog.Warn("SMS inbox reader stopped", "error", runErr)
 			}
 		}()

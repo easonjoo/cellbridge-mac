@@ -46,10 +46,40 @@ SIP_PASS="${SIP_PASS:-cellbridge-$(id -un)}"
 
 mkdir -p "$RUN" "$DATA" "$LOG"
 
+# 列出模块上真正在跑的语音路由 watchdog 进程 PID。
+# 必须精确匹配 cmdline：宽松匹配（grep voice-route-watchdog）会把探测命令
+# 自身以及 `sh -c '...'` 包装进程也算进去，导致"看着有、实际没有"的误判。
+_remote_watchdog_pids() {
+  command -v adb >/dev/null 2>&1 || return 0
+  adb shell 'for d in /proc/[0-9]*; do
+    [ -r "$d/cmdline" ] || continue
+    x=$(tr "\000" " " < "$d/cmdline" 2>/dev/null)
+    x=${x% }
+    case "$x" in
+      "/bin/busybox /bin/sh /data/voice-route-watchdog.sh"|"/bin/sh /data/voice-route-watchdog.sh"|"/system/bin/sh /data/voice-route-watchdog.sh")
+        echo "${d#/proc/}" ;;
+    esac
+  done' 2>/dev/null
+}
+
+# 回收模块侧的 watchdog。它由 Mac 侧 adb 会话托管，stop 时必须显式清理，
+# 否则每启动一次就泄漏一个循环，长期值守下持续唤醒模块 CPU → 发热。
+kill_remote_watchdog() {
+  local pids n=0
+  pids="$(_remote_watchdog_pids)"
+  if [ -z "$pids" ]; then echo 0; return 0; fi
+  for p in $pids; do
+    adb shell "kill -9 $p" >/dev/null 2>&1 && n=$((n + 1))
+  done
+  echo "$n"
+}
+
 if [ "${1:-}" = "stop" ]; then
   for pat in "cellbridge-gateway" "voice-audio-bridge" "at_pty_bridge.py"; do
     pkill -f "$pat" 2>/dev/null && echo "已停止 $pat"
   done
+  KILLED="$(kill_remote_watchdog)"
+  [ -n "${KILLED:-}" ] && [ "$KILLED" != "0" ] && echo "已清理模块侧 watchdog 实例 × $KILLED"
   exit 0
 fi
 
@@ -75,11 +105,17 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
   # 二进制用 nohup 启动可在 adb shell 退出后存活。
   adb shell 'pidof mavo-pcm-bridge >/dev/null || { [ -x /data/mavo-pcm-bridge ] && nohup /data/mavo-pcm-bridge --verbose --voice-route-session > /data/mavo-bridge.log 2>&1 & sleep 2; }' 2>/dev/null
   adb shell 'pidof mavo-pcm-bridge >/dev/null && echo "    mavo-pcm-bridge 运行中" || echo "    警告：mavo-pcm-bridge 未运行"' 2>/dev/null
-  # 部署路由自愈脚本到模块（幂等）
-  adb shell '[ -x /data/voice-route-watchdog.sh ] || { cat > /data/voice-route-watchdog.sh <<EOF
+  # 部署路由自愈脚本到模块（每次覆盖写入，保证内容升级能生效）
+  #
+  # 散热优化：原实现每 3 秒无条件 set 8 条路由，模块 CPU/DSP 被持续唤醒。
+  # 现改为「先 get 探一条代表性路由 → 只有被 DSP 复位时才全量补写」，
+  # 并每 6 轮（≈60s）做一次全量校验兜底。稳态下每 10 秒仅 1 次 get。
+  adb shell 'cat > /data/voice-route-watchdog.sh <<EOF
 #!/system/bin/sh
 T=/data/mini_tinymix
-while true; do
+PROBE="AFE_PCM_RX_Voice Mixer CSVoice"
+
+apply_all() {
   \$T set "AFE_PCM_RX_Voice Mixer CSVoice" 1
   \$T set "AFE_PCM_RX_Voice Mixer VoLTE" 1
   \$T set "AFE_PCM_RX_Voice Mixer VoiceMMode1" 1
@@ -88,16 +124,45 @@ while true; do
   \$T set "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" 1
   \$T set "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" 1
   \$T set "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2" 1
-  sleep 3
+}
+
+verify_all() {
+  for r in "AFE_PCM_RX_Voice Mixer CSVoice" "AFE_PCM_RX_Voice Mixer VoLTE" "AFE_PCM_RX_Voice Mixer VoiceMMode1" "AFE_PCM_RX_Voice Mixer VoiceMMode2" "Voice_Tx Mixer AFE_PCM_TX_Voice" "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2"; do
+    v=\$(\$T get "\$r" 2>/dev/null)
+    [ "\$v" = "1" ] || \$T set "\$r" 1
+  done
+}
+
+i=0
+while true; do
+  v=\$(\$T get "\$PROBE" 2>/dev/null)
+  if [ "\$v" != "1" ]; then
+    apply_all
+  elif [ \$((i % 6)) -eq 0 ]; then
+    verify_all
+  fi
+  i=\$((i + 1))
+  sleep 10
 done
 EOF
-chmod +x /data/voice-route-watchdog.sh; }' 2>/dev/null
-  # 语音路由 watchdog：通话挂断时 DSP 会把 VoLTE 路由复位，需每 3 秒补写。
+chmod +x /data/voice-route-watchdog.sh' 2>/dev/null
+  # 语音路由 watchdog：通话挂断时 DSP 会把 VoLTE 路由复位，需补写。
   # 必须从 Mac 侧用持久 adb 会话托管（模块侧 nohup/setsid 启动的 shell 脚本
   # 会随 adb shell 退出被杀，二进制则可存活）。
+  #
+  # 单例化：先回收模块上遗留的旧 watchdog 实例。历史实现每次启动都新起一个
+  # 且 stop 不回收，长期值守会累积成多个循环叠加（实测发现同时跑 2 个）。
+  OLD="$(kill_remote_watchdog)"
+  [ -n "${OLD:-}" ] && [ "$OLD" != "0" ] && echo "    已回收遗留 watchdog × $OLD"
   adb shell sh /data/voice-route-watchdog.sh > /dev/null 2>&1 &
-  sleep 1
-  if kill -0 $! 2>/dev/null; then echo "    语音路由 watchdog 运行中（Mac 托管）"; else echo "    警告：watchdog 启动失败"; fi
+  sleep 2
+  # 用实际进程数确认（`kill -0 $!` 只说明 adb 客户端还在，不能证明模块侧循环活着）
+  WN="$(_remote_watchdog_pids | wc -l | tr -d ' ')"
+  if [ "${WN:-0}" -ge 1 ]; then
+    echo "    语音路由 watchdog 运行中（Mac 托管，10s 探测 / 仅复位时补写）"
+  else
+    echo "    警告：watchdog 未启动（通话挂断后语音路由可能不被修复）"
+  fi
 else
   echo "    警告：找不到 adb，跳过 CS 路由写入"
 fi
@@ -137,13 +202,24 @@ fi
 echo "    模块串口: $TTY_PATH"
 
 # --- 组件 2：音频桥（FIFO 模式）---
-echo "[2/3] 启动音频桥（FIFO 模式）..."
+# 散热开关（均可用环境变量覆盖）：
+#   CB_AUDIO_IDLE_SUSPEND  1=无通话时暂停 AudioUnit（默认，省电降热）
+#   CB_AUDIO_IDLE_SECONDS  空闲超过多久后暂停（默认 10 秒）
+# 原理：空闲时音频桥仍以 ~8000 fr/s 双向全速搬运，模块 UAC 端点被 USB
+# 主机持续轮询、无法进入低功耗，是长期值守的主要热源之一。暂停后由
+# tx FIFO 出现数据（网关通话时每 20ms 写一帧）自动唤醒。
+export CB_AUDIO_IDLE_SUSPEND="${CB_AUDIO_IDLE_SUSPEND:-1}"
+export CB_AUDIO_IDLE_SECONDS="${CB_AUDIO_IDLE_SECONDS:-10}"
+echo "[2/3] 启动音频桥（FIFO 模式，空闲挂起=${CB_AUDIO_IDLE_SUSPEND}，阈值=${CB_AUDIO_IDLE_SECONDS}s）..."
 "$BRIDGE" --fifo-rx "$RX_FIFO" --fifo-tx "$TX_FIFO" --verbose \
   > /dev/null 2> "$LOG/audio-bridge.log" &
 
 # --- 组件 3：网关 ---
 # 真实短信（不设则默认 dry-run）
 export CELLBRIDGE_SMS_DRY_RUN="${CELLBRIDGE_SMS_DRY_RUN:-false}"
+# 短信收件箱轮询间隔。默认 5s 保持原有及时性；长期值守想进一步降热可设
+# CELLBRIDGE_SMS_POLL_INTERVAL=30s（代价：收到短信最多延迟该时长）。
+export CELLBRIDGE_SMS_POLL_INTERVAL="${CELLBRIDGE_SMS_POLL_INTERVAL:-5s}"
 
 # --- PushKit token（来电 CallKit 振铃 / 短信通知唤醒的必要条件）---
 # 获取方式：YakPhone → 设置 → 推送/Push 页 → 复制 Push Token（形如 AAA...==）。

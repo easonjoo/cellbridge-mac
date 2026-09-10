@@ -89,6 +89,47 @@ iPhone 端（YakPhone）配置：SIP 服务器填 Mac 的局域网 IP 或 Tailsc
 用户名密码如上。默认 SMS dry-run=true（只入库不发送）；要真实发短信，在启动前
 `export CELLBRIDGE_SMS_DRY_RUN=false`（`start_cellbridge.sh` 已默认设为 `false`）。
 
+## 长期值守：散热优化（2026-09-10）
+
+4G 模块长时间挂机发热明显。软件层找到并消除了三个**持续性**热源——它们都不是
+功能必需的，只是原实现没有做空闲处理：
+
+| 热源 | 原行为 | 现在 |
+|---|---|---|
+| 音频桥空转 | 无通话时两个 AudioUnit 仍以 ~8000 fr/s 双向全速搬运，模块 UAC 端点被 USB 主机持续轮询、无法进入低功耗 | 空闲 10s 后暂停 AudioUnit；网关通话时每 20ms 写 tx FIFO，桥据此**自动唤醒** |
+| 模块侧语音路由 watchdog | 每 3 秒无条件 `set` 8 条 tinymix 路由；且每次启动都新起一个、`stop` 不回收，实测会累积成多个循环叠加 | 改为「先 `get` 探一条代表性路由 → 仅被 DSP 复位时才全量补写」，10s 一轮，并做**单例化**（启动前回收遗留、`stop` 时清理） |
+| 短信收件箱轮询 | 固定每 5s 发 `AT+CPMS` + `AT+CMGL` 唤醒基带 | 默认仍 5s（不牺牲及时性）；可用 `CELLBRIDGE_SMS_POLL_INTERVAL=30s` 降频 |
+
+实测（模块 `/proc/stat`，5 秒窗口）：模块 CPU 使用率 **5.7% → 0.6%**。
+
+可调参数（启动前 `export` 即可）：
+
+```bash
+CB_AUDIO_IDLE_SUSPEND=1            # 1=启用空闲挂起（默认）；0=关闭，恢复旧的全速常开行为
+CB_AUDIO_IDLE_SECONDS=10           # 空闲多久后挂起（默认 10 秒）
+CELLBRIDGE_SMS_POLL_INTERVAL=5s    # 短信轮询间隔；想更省电可设 30s（代价：短信最多延迟该时长）
+```
+
+确认是否真的挂起了：
+
+```bash
+tail -f ~/.cellbridge/run/logs/audio-bridge.log
+# 空闲时预期：
+#   [idle] 第 1 次暂停 AudioUnit（已空闲 10s，等待通话音频唤醒）
+#   [stats] [已挂起] cellular->fifo=0 fr fifo->cellular=0 fr dropped=0 B
+# 来电/去电时自动出现：
+#   [idle] 检测到通话音频，AudioUnit 已恢复
+```
+
+万一通话没声音，先 `CB_AUDIO_IDLE_SUSPEND=0` 重启以排除本特性；挂起若恢复失败会
+自动退回常开模式并打印 `[idle] AudioUnit 恢复失败，退回常开模式`，不会牺牲通话能力。
+
+模块温度可随时自查（需 adb）：
+
+```bash
+adb shell 'for z in /sys/class/thermal/thermal_zone*; do echo "$(cat $z/type) $(cat $z/temp)"; done'
+```
+
 ## 与 DJiPhone Kit 的关系
 
 - **互斥**：App 与本栈都独占 USB AT 接口（interface 2），启动脚本会先退出 App。
