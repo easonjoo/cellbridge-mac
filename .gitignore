@@ -4,40 +4,28 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
 .venv/
 venv/
-env/
+
+# 构建产物（install.sh / rebuild-gateway.sh 生成）
+cellbridge-gateway
+cellbridge-gateway.new
+cellbridge-gateway.bak-*
+voice-audio-bridge
+CellBridge Console.app/
 
 # 运行时数据（含个人敏感信息：手机号/通话记录，切勿提交）
+.cellbridge/
+data_usage.json
 sent_sms.json
 call_history.json
-data_usage.json
-
-# WorkBuddy 项目数据
-.workbuddy/
-
-# 生成的图片素材与分享文案（非代码，不开源）
-*.png
-*.jpg
-*.jpeg
-*.webp
-cover_plan_*/
-xiaohongshu_post.md
-douyin_post.md
 
 # 模块侧语音运行时（闭源二进制不进仓库；voice_runtime.provision_runtime() 可在线下载并 SHA-256 校验）
 voice-runtime/
 
-# CellBridge macOS 移植：网关二进制与运行目录
-cellbridge-mac/cellbridge-gateway
-cellbridge-mac/cellbridge-gateway.new
-cellbridge-mac/cellbridge-gateway.bak-*
-cellbridge-mac/voice-audio-bridge
-.cellbridge/
-cellbridge-mac/CellBridge Console.app/
-cellbridge-mac/__pycache__/
-
-# 第三方固件 / EDL 刷机工具（121MB，含上游 GPL 工具链，与 macOS 移植无关）
+# 第三方固件 / EDL 刷机工具（121MB，含上游 GPL 工具链，与本移植无关）
 # 需要时自行获取：https://github.com/bkerler/edl
 firmware-qdc507/
+
+# WorkBuddy 项目数据
+.workbuddy/

@@ -40,10 +40,10 @@ Tailscale 连到 Mac，即可用 SIM 卡号码收发短信、拨打/接听 VoLTE
 
 # 音频桥
 cd /path/to/mac-4g-modem
-swiftc -O voice_audio_bridge.swift -o cellbridge-mac/voice-audio-bridge
+swiftc -O voice_audio_bridge.swift -o voice-audio-bridge
 
 # 控制台 App
-cd cellbridge-mac && ./build_console.sh
+cd 仓库根目录 && ./build_console.sh
 ```
 
 ## 启动 / 停止

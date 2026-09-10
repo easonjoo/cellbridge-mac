@@ -1,184 +1,121 @@
-# DJiPhone Kit
+# CellBridge-mac
 
-让 Mac 插上大疆 QDC507 4G 模块，变成一台真正的"蜂窝版 Mac"：收发短信、拨打电话、实时网速与流量统计，外加 macOS 菜单栏常驻信号/网速显示。
+**让一台 Mac 变成 4G 蜂窝语音网关**：插上 QDC507 / EG25-G 4G 模块和 SIM 卡，
+iPhone 上的任意 SIP 客户端（推荐 [YakPhone](https://apps.apple.com/app/yakphone/id1529270977)）
+即可用这张 SIM 卡的号码拨打 / 接听 VoLTE 电话、收发短信——走局域网或 Tailscale，人在哪里都能用。
 
-无需内核驱动、无需 `.kext`，纯 Python + pyusb 直接操作 USB 端点；内置 macOS 原生 App（pywebview）与手机端 PWA，底部四 Tab（状态 / 短信 / 通话 / 更多）交互。
+```
+iPhone (YakPhone, SIP/RTP)          Mac (本仓库)                       4G 模块 (USB)
+┌─────────────────────┐    ┌────────────────────────────────┐    ┌──────────────┐
+│  打电话 / 收短信 UI  │◄──►│ cellbridge-gateway (SIP 5060)  │◄──►│  VoLTE 语音   │
+│  CallKit 来电推送    │    │        + 短信引擎 + Web 控制面  │    │  AT 指令      │
+└─────────────────────┘    │ voice-audio-bridge (PCM 桥)    │    │  UAC 8kHz    │
+      局域网 / Tailscale    │ at_pty_bridge (AT→PTY 串口)    │    └──────────────┘
+                           └────────────────────────────────┘
+```
 
-## ✨ 功能特性
+> **致谢**：本项目基于 [mccding/CellBridge](https://github.com/mccding/CellBridge) 构建。
+> 网关本体（SIP 服务器、短信引擎、Web 控制面、语音桥接框架）全部来自 CellBridge 上游，
+> 本仓库在其之上做了 macOS + USB 4G 模块的移植与十余处修复（`gateway-patched/`）。
+> 没有这个优秀的开源项目，就没有 CellBridge-mac —— 衍生修复以同一 MIT 协议回馈社区。
 
-- 📨 **短信收发**：文本模式收发、会话式聊天视图、已发短信持久化留存
-- 📞 **语音通话**：拨号 / 接听 / 挂断 / DTMF 按键、通话记录（含时长）、来电浮层
-- 📊 **实时网速**：基于基带计数器 `AT+QGDCNT` 的真实上下行速率 + 折线图
-- 📈 **流量统计**：今日 / 本月 / 模块累计消耗，可一键清零
-- 🖥 **macOS 菜单栏**：常驻信号格数 + ↓↑ 实时网速，菜单含今日/本月流量
-- 📱 **手机端 PWA**：局域网内 iPhone/iPad 通过浏览器访问，iOS 原生风 UI，支持 PIN 鉴权
-- 🛰 **GPS 定位**：开关模块 GPS、读取经纬度并在地图展示
-- ⌨️ **AT 控制台**：内置 AT 指令调试台，附常用快捷指令
-- 🔄 **自动重连**：模块拔插后自动恢复
+## 硬件前提
 
-## 🔧 硬件要求
+- **Mac**（Intel 或 Apple Silicon 均可）
+- **4G 模块**：BAIWANG QDC507（DJI 定制，VID `0x2CA3` / PID `0x4006`）或 Quectel EG25-G 系列，经 USB 连接
+- **SIM 卡**：插在模块里，开通 VoLTE，能正常打电话收短信
+- **iPhone**：装 [YakPhone](https://apps.apple.com/app/yakphone/id1529270977)（或任意 SIP 客户端）
+- **模块侧语音运行时**：模块内需已部署 VoLTE PCM 桥（`mavo-pcm-bridge`）与语音内核模块。
+  可用 `module-tools/voice_runtime.py provision_runtime()` 在线拉取并校验后经 ADB 部署，
+  或使用 [DJIphone Kit](https://github.com/easonjoo/DJiPhone-Kit) 一键部署。
 
-- **大疆（DJI Cellular / 百旺 QDC507）4G 模块**
-  - `VID=0x2CA3, PID=0x4006`，固件实测 `QDC507GLEFM21`
-  - AT 指令端口为 **Interface 2**，端点 `0x03`（写）/ `0x84`（读）
-- 一张可用的 SIM 卡
-- macOS（Intel / Apple Silicon 均可）
-
-> ⚠️ 其他型号模块的 `VID/PID/接口号/端点` 可能不同，需调整 `sms_server.py` 顶部的常量。
-
-## 🚀 快速开始
-
-### 方式一：源码运行
+## 一键安装
 
 ```bash
-# macOS 安装 libusb（pyusb 依赖的系统库）
-brew install libusb
-
-# 安装 Python 依赖
-pip install -r requirements.txt
-
-# 启动（会自动打开浏览器）
-bash start_web.sh
+git clone https://github.com/easonjoo/cellbridge-mac.git
+cd cellbridge-mac
+./install.sh              # 缺什么补什么：依赖检查 → 拉上游源码 → 打补丁 → 编译 → 构建控制台
+./install.sh --force      # 全部重新编译
 ```
 
-### 方式二：打包为 App
+安装脚本会做这些事（也可手动逐步执行，见 [README-mac.md](README-mac.md)）：
+
+1. 检查依赖：Go 1.25+、Python 3 + pyusb、swiftc（Xcode CLT）、adb
+2. 拉取 [mccding/CellBridge](https://github.com/mccding/CellBridge) 上游源码到 `/tmp/CellBridge-main`
+3. 用 `gateway-patched/` 覆盖上游并编译出 `cellbridge-gateway`（含 12+ 处 macOS/蜂窝修复）
+4. 编译 `voice-audio-bridge`（Swift，蜂窝 UAC 音频 ↔ FIFO）
+5. 构建 `CellBridge Console.app`（原生 AppKit 控制台，可选装到 /Applications）
+6. 打印 YakPhone 需要填写的服务器地址
+
+## 启动
 
 ```bash
-bash build_app.sh   # 生成 ~/Applications/DJiPhone Kit.app
+./start_cellbridge.sh
 ```
 
-浏览器打开 <http://localhost:8080>（手机端 <http://<Mac 的 IP>>:8080/m），即可收发短信、拨打电话。
+脚本会自动完成：退出占用 USB 的 App → 拉起 AT 串口桥 → 等待串口就绪 → 强制重挂语音路由
+→ 启动网关（等健康检查 OK，非固定 sleep）→ 探测 Tailscale → 拉起通话后路由自动重挂守护
+（rearm）→ 打印当前状态横幅。
 
-## 📲 让 iPhone 变成模块的分机（CellBridge-mac）
+**登录自启动（推荐）**：给 `~/Library/LaunchAgents` 加一个 plist 指向本目录的
+`start_cellbridge.sh`（`RunAtLoad=true`、`KeepAlive={SuccessfulExit:false}`），重启后自动就绪。
 
-上面那套是「Mac 本地收发」。如果你想让 **iPhone 直接用模块的号码打电话、收短信**，
-用 `cellbridge-mac/` —— 它在 Mac 上跑一个 SIP 网关，YakPhone 作为 SIP 话机接入，
-来电走 CallKit 系统来电界面，短信双向同步。
+## iPhone 端配置（YakPhone）
 
-```bash
-./install.sh          # 一键安装：查依赖 → 拉上游 → 打补丁 → 编译网关/音频桥/控制台
-./install.sh --force  # 全部重新编译
-```
+| 设置项 | 值 |
+|---|---|
+| SIP 服务器 | Mac 的局域网 IP（或 Tailscale IP `100.x.y.z`）+ 端口 `5060` |
+| 用户名 | `iphone` |
+| 密码 | `cellbridge-<你的Mac用户名>`（如 `cellbridge-idoer`） |
+| 传输 | UDP |
 
-装完双击 **CellBridge Console.app**（原生 AppKit 控制台）：
+填好后注册成功，即可：
 
-- **顶部一键部署**：启动 / 停止 / 重启 / 重编译 / 体检 / 打开日志与目录
-- **概览**：网关、AT 桥、音频桥、语音路由、SIP 注册新鲜度、推送状态六张状态卡
-- **短信**：记录列表 + 直接发短信（走 SIP MESSAGE，与 YakPhone 同一通道）
-- **通话 / 音频 / 日志**：通话记录、音频链路实时帧率、日志尾部
-- **参数**：粘贴 YakPhone 的 PushKit token、验证推送、一键体检
+- **打电话**：直接在 YakPhone 里拨号（网关经 VoLTE 呼出）；别人打进 SIM 号码，iPhone 弹原生来电
+- **收短信**：进网关 Web 控制面 `http://<Mac IP>:8787` 查看，或注册的 SIP 客户端接收
+- **发短信**：Web 控制台 / 控制台 App / `./send-sms.py <号码> <内容>`
+- **锁屏来电**：在 YakPhone 里复制 PushKit token，跑 `./set-push-token.sh` 写入网关
+  （否则后台/锁屏状态下来电不振铃，这是唯一还需要手动配的项）
 
-命令行等价物：
+随时体检：`./doctor.sh`（只读，8 节报告，末尾直接给出 YakPhone 该填的地址）。
 
-| 命令 | 用途 |
-| --- | --- |
-| `cellbridge-mac/start_cellbridge.sh` | 启动全栈（`stop` 停止） |
-| `cellbridge-mac/doctor.sh` | 只读体检，不碰串口 |
-| `cellbridge-mac/set-push-token.sh` | 写入 PushKit token |
-| `cellbridge-mac/test-push.sh` | 不打电话验证 token 是否有效 |
-| `cellbridge-mac/rebuild-gateway.sh` | 重新编译网关（含 go test） |
-| `cellbridge-mac/send-sms.py <号码> <正文>` | 命令行发短信 |
-
-完整说明与修复记录见 [cellbridge-mac/README-mac.md](./cellbridge-mac/README-mac.md)。
-
-> ⚠️ CellBridge 与 DJiPhone Kit App **互斥**：两者都独占模块的 USB AT 接口（Interface 2），
-> `start_cellbridge.sh` 会自动先退出 App。
-
-## 📁 项目结构
+## 仓库结构
 
 ```
-DJiPhone Kit/
-├── install.sh             # 一键安装（依赖检查 → 编译网关/音频桥/控制台）
-├── sms_server.py          # Flask 后端核心（USB 通信 + 短信 + 通话 + 流量 + GPS + 局域网鉴权）
-├── app.py                 # pywebview 桌面壳（加载本地 UI + 菜单栏状态项）
-├── menubar.py             # macOS 菜单栏常驻项（pyobjc NSStatusItem：信号格 + 网速）
-├── index.html             # 桌面端前端（底部四 Tab，macOS 原生设计语言）
-├── mobile.html            # 手机端 PWA（底部四 Tab，iOS 原生设计语言）
-├── voice_audio_bridge.swift # Mac 通话音频桥（CoreAudio 8kHz 双工）
-├── voice_runtime.py       # 通话音频辅助
-├── build_app.sh           # 一键打包 macOS App 脚本
-├── sms_tool.py            # 命令行短信工具（status/send/list/read/delete）
-├── probe_eg25g.py         # USB 设备探测脚本
-├── diagnose_network.py    # 4G 网络诊断脚本
-├── fix_network.py         # 4G 网络修复脚本（重启数据连接）
-├── cellbridge-mac/        # ★ iPhone 分机方案（SIP 网关 + 原生控制台）
-│   ├── CellBridgeConsole.swift  # 原生 AppKit 控制台（一键部署 + 状态 + 发短信）
-│   ├── gateway-patched/         # 上游网关的 macOS 修复补丁源码
-│   ├── rebuild-gateway.sh       # 拉上游 + 打补丁 + go test + 编译
-│   ├── start_cellbridge.sh      # 启动全栈（AT 桥 + 音频桥 + 网关）
-│   ├── at_pty_bridge.py         # USB AT ↔ PTY 串口桥
-│   ├── doctor.sh                # 只读体检
-│   ├── send-sms.py              # SIP MESSAGE 发短信
-│   ├── set-push-token.sh        # 写入 YakPhone PushKit token
-│   ├── test-push.sh             # 验证推送 token
-│   ├── build_console.sh         # 构建 CellBridge Console.app
-│   └── README-mac.md            # 移植说明 + 12 处根因修复记录
-├── PROCESS.md             # 开发过程记录（含固件踩坑）
-├── requirements.txt       # Python 依赖
-└── LICENSE
+├── install.sh                  # 一键安装（依赖 → 拉上游 → 打补丁 → 编译 → 构建 App）
+├── start_cellbridge.sh         # 一键启动全套服务（就绪探测 + 守护拉起）
+├── doctor.sh                   # 只读体检：进程/AT/SIP 注册/推送/短信/通话/重挂链路
+├── remote-check.sh             # 远程使用四项速查（Tailscale/SIP/push token）
+├── tailnet-setup.sh            # Tailscale 组网与 Serve 配置
+├── gateway-patched/            # 上游 CellBridge 源码 + macOS/蜂窝补丁（含单测）
+├── rebuild-gateway.sh          # 重新拉上游 + 打补丁 + go test + 编译网关
+├── at_pty_bridge.py            # 模块 USB AT 通道 → PTY 串口桥
+├── voice_audio_bridge.swift    # 蜂窝 UAC 音频 ↔ FIFO（编译为 voice-audio-bridge）
+├── CellBridgeConsole.swift     # 原生 AppKit 控制台（build_console.sh 构建）
+├── CellBridgeWidget.app/       # 桌面右缘状态小组件（环形仪表，悬停看明细）
+├── widget/                     # 小组件源码（探针聚合器 + 界面）
+├── mavo-route.sh               # 模块侧 VoLTE 路由会话重挂
+├── route-rearm.sh              # 通话结束后自动重挂守护（每通电话都跑在新会话上）
+├── tests/route-rearm-harness.sh# rearm 状态机离线回归（5 场景，无需真机）
+├── send-sms.py / set-push-token.sh / test-push.sh
+├── verify_cs_route.py          # 端到端 CS 语音路由验证（FIFO PCM 统计）
+├── module-tools/               # 模块侧工具：语音运行时部署 / UAC 音频开关 / tinyalsa 混音器
+└── README-mac.md               # 详细文档：配置、排障、12+ 处上游修复清单
 ```
 
-## ⚙️ 工作原理
+## 排障
 
-macOS 缺少 CDC-ACM 串口驱动，无法识别模块的 vendor-specific（class `0xFF`）接口。本项目通过 **pyusb + libusb 直接读写 USB bulk 端点**，在用户态发送 AT 指令，完全绕过内核驱动：
+先跑 `./doctor.sh`，然后看 [README-mac.md](README-mac.md) 的「排障」章节——里面有一张
+症状速查表（接不通/没声音/第二通哑/推送不响/短信失败）和 12+ 处已修复的上游缺陷清单
+（含每处的根因分析），多数问题都能对号入座。
 
-```
-枚举 USB 设备 → 找到 AT 指令接口 → write 端点发 AT → read 端点读响应
-```
+## 致谢与许可
 
-后台用 Flask 包一层 REST API，前端通过 HTTP 轮询实现实时交互；流量统计直接读模块基带计数器 `AT+QGDCNT`（注意：该固件返回的是**字节**而非文档标注的 KB）。
+- **[mccding/CellBridge](https://github.com/mccding/CellBridge)** —— 本项目的根基。
+  网关、短信引擎、语音桥接框架、控制面均来自上游；本仓库的 `gateway-patched/` 只是
+  在其上的移植层与缺陷修复。感谢上游作者的出色工作。
+- [YakPhone](https://apps.apple.com/app/yakphone/id1529270977) —— iPhone 端 SIP 客户端。
+- [Tailscale](https://tailscale.com/) —— 异地组网，让蜂窝网关跟着你走。
+- [bkerler/edl](https://github.com/bkerler/edl) —— 模块刷机/救援工具链（未随仓库分发）。
 
-## 🔌 开启语音通话（USB 音频）
-
-模块的 USB 音频接口**默认关闭**，需先开启一次（配置会持久化）：
-
-```python
-AT+QCFG="usbcfg",0x2CA3,0x4006,1,1,1,1,1,0,1   # 最后一个参数 audio=1
-AT&W                                            # 保存
-AT+CFUN=1,1                                     # 重启模组生效
-```
-
-重启后 macOS 会识别出 USB 音频设备（8000Hz 电话音质），通话时在「系统设置 → 声音」选择即可。
-
-## 🐛 常见问题（踩坑记录）
-
-更多固件怪癖与调试记录见 [PROCESS.md](./PROCESS.md)。
-
-### 1. 模块能拿到 IP，但 Mac 上不了 IPv4
-
-EG25-G 的 RNDIS/ECM 网卡 DHCP 服务可能卡死。给 Mac 网卡配静态 IP 绕开 DHCP，或运行 `fix_network.py` 重启模块数据连接。
-
-### 2. 挂断后仍显示「通话中」/ 无法重拨
-
-固件会残留空号码的 `active` 状态（phantom call），且挂断后 2 秒内仍报 `dialing`。后端已加入 phantom call 过滤 + 挂断冷却期双重保护。
-
-### 3. AT+QGPS=0 关不掉 GPS
-
-该固件返回 `+CME ERROR: 501`，属固件行为；开启（`AT+QGPS=1`）与读数（`AT+QGPSLOC?`）均正常。
-
-## 🙏 致谢
-
-本项目站在以下优秀项目的肩膀上，感谢这些作者的开源分享：
-
-| 项目 | 作者 | 借鉴内容 |
-| --- | --- | --- |
-| [DJOneHub](https://github.com/ZenGeekLabs/DJOneHub) | ZenGeekLabs | 模块 USB 模式识别与设置面板设计思路 |
-| [CellDock](https://github.com/celldock/celldock-for-mac) | celldock | 菜单栏状态项、短信/通话交互设计参考 |
-| [NasAnySim](https://github.com/mccding/NasAnySim) | @mccding | 移动端 PWA UI 风格与自托管蜂窝网关思路 |
-| [mac-4g-modem](https://github.com/zxd-sudo/mac-4g-modem) | zxd | pyusb 用户态 AT 通信的最初实现基础 |
-
-同时感谢社区里所有研究 QDC507 / VoHive / MaVo 生态的玩家，你们公开的踩坑记录让后来者少走了很多弯路。
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！提交前请确认不要包含任何个人隐私数据（`call_history.json`、`sent_sms.json` 等运行时数据已被 `.gitignore` 排除）。
-
-## ⚖️ 免责声明
-
-本项目是**独立开发的非官方开源项目**，**未获得 DJI 的授权、赞助或认可**，与 DJI、Quectel、运营商或 eSIM 设备厂商**不存在隶属或合作关系**。
-
-DJI 及相关产品名称是其各自权利人的商标，**仅用于说明兼容**，不代表任何商业关联或背书。请遵守当地法律法规使用短信/通话功能，录制通话前请征得对方同意。
-
-## 📄 License
-
-[MIT](./LICENSE)
+本项目以 [MIT](LICENSE) 协议开源，与上游 CellBridge 一致。

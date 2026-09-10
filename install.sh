@@ -168,7 +168,7 @@ step "4/6" "构建原生控制台 App"
 if ( cd "$CM_DIR" && ./build_console.sh ) >/dev/null 2>&1; then
   ok "CellBridge Console.app 构建完成"
 else
-  bad "控制台构建失败，手动排查：cd cellbridge-mac && ./build_console.sh"
+  bad "控制台构建失败，手动排查：cd $REPO_DIR && ./build_console.sh"
   exit 1
 fi
 
