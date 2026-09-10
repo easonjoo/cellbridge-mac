@@ -121,6 +121,11 @@ func (s *SIPCallSession) beginAnswer() bool {
 	return true
 }
 
+// inboundActiveWait bounds how long the answer path waits for the cellular
+// leg to report active. The transition completes well under a second once
+// ATA is accepted, so a long deadline only delays audio when CLCC misbehaves.
+const inboundActiveWait = 8 * time.Second
+
 // AnswerInbound completes an inbound cellular call: it picks up the
 // cellular leg (ATA) and then starts the PCM<->RTP bridge, mirroring the
 // outbound AwaitBridge path. The caller is already waiting, so a missing
@@ -129,9 +134,15 @@ func (s *SIPCallSession) AnswerInbound(ctx context.Context) error {
 	if err := s.modem.Answer(ctx); err != nil {
 		return fmt.Errorf("modem answer failed: %w", err)
 	}
-	waitCtx, waitCancel := context.WithTimeout(s.ctx, 20*time.Second)
+	waitCtx, waitCancel := context.WithTimeout(s.ctx, inboundActiveWait)
 	defer waitCancel()
-	if answered, err := s.modem.WaitActive(waitCtx); err != nil || !answered {
+	// An answered inbound call is reported with +CLCC dir=1. The shared
+	// helper matched dir=0 only, so this never confirmed: the answer path
+	// burned its whole deadline and every answered inbound call was silent
+	// (outbound worked because a dialled call really is dir=0). Accept
+	// either direction — V1 permits exactly one concurrent call — and let
+	// the clcc log line record what the module actually reported.
+	if answered, err := s.modem.WaitActiveDir(waitCtx, modem.CLCCDirAny); err != nil || !answered {
 		slog.Warn("inbound cellular not confirmed active", "id", s.ID, "err", err)
 	}
 	callID := modem.CallID(s.ID)

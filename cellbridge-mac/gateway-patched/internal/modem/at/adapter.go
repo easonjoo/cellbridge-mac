@@ -324,35 +324,73 @@ func (a *Adapter) DeleteSMS(ctx context.Context, storageIndex string) error {
 
 func (a *Adapter) Events() <-chan modem.ModemEvent { return a.events }
 
-// WaitActive polls AT+CLCC until the outgoing call is answered (dir=0,
-// state=0 active) or the context ends. Opening UAC capture before the
+// clccActive reports whether the +CLCC lines describe a call in the given
+// direction that has reached state 0 (active). dir < 0 matches either
+// direction. Kept separate from the polling loop so the direction matching
+// is unit-testable without a live modem.
+func clccActive(lines []string, dir int) bool {
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "+CLCC:") {
+			continue
+		}
+		// +CLCC: <id>,<dir>,<state>,<mode>,<mpty>,<number>,<type>
+		fields := strings.Split(strings.TrimPrefix(line, "+CLCC:"), ",")
+		if len(fields) < 3 {
+			continue
+		}
+		callDir, dirErr := strconv.Atoi(strings.TrimSpace(fields[1]))
+		state, stateErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if dirErr != nil || stateErr != nil {
+			continue
+		}
+		if state == 0 && (dir < 0 || callDir == dir) {
+			return true
+		}
+	}
+	return false
+}
+
+// WaitActive polls AT+CLCC until an outgoing call is answered. Kept for the
+// dial path; inbound uses WaitActiveDir with dir=1.
+func (a *Adapter) WaitActive(ctx context.Context) (bool, error) {
+	return a.WaitActiveDir(ctx, modem.CLCCDirOutgoing)
+}
+
+// WaitActiveDir polls AT+CLCC until a call in the given direction reaches
+// state 0 (active), or the context ends. Opening UAC capture before the
 // cellular leg is active wedges the ALSA ASYNC stream into an XRUN that
 // reads silence forever, so the SIP bridge must wait for this before
 // starting audio.
-func (a *Adapter) WaitActive(ctx context.Context) (bool, error) {
+//
+// Upstream hard-coded dir=0 here. An inbound (mobile terminated) call is
+// reported with dir=1, so the answer path could never confirm the pickup:
+// it blocked for its entire deadline and only then started the audio
+// bridge — by which time the caller had already hung up. Every answered
+// inbound call was silent while outbound worked, because outbound really is
+// dir=0.
+func (a *Adapter) WaitActiveDir(ctx context.Context, dir int) (bool, error) {
+	var lastSeen []string
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Warn("clcc wait timed out", "dir", dir, "last_clcc", lastSeen)
 			return false, ctx.Err()
 		default:
 		}
 		lines, err := a.client.Exchange(ctx, "AT+CLCC")
 		if err == nil {
-			for _, line := range lines {
-				// +CLCC: <id>,<dir>,<state>,... — answered is dir=0 outgoing, state=0 active
-				if strings.HasPrefix(line, "+CLCC:") {
-					fields := strings.Split(strings.TrimPrefix(line, "+CLCC:"), ",")
-					if len(fields) >= 3 && strings.TrimSpace(fields[1]) == "0" && strings.TrimSpace(fields[2]) == "0" {
-						return true, nil
-					}
-				}
+			if clccActive(lines, dir) {
+				slog.Info("clcc call active", "dir", dir, "lines", lines)
+				return true, nil
 			}
+			lastSeen = lines
 		}
 		timer := time.NewTimer(300 * time.Millisecond)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
+			slog.Warn("clcc wait timed out", "dir", dir, "last_clcc", lastSeen)
 			return false, ctx.Err()
 		}
 	}

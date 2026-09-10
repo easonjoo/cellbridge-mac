@@ -368,15 +368,15 @@ func (s *Server) acceptInbound(sess *SIPCallSession, msg string, remote *net.UDP
 	}
 	callID := sess.ID
 	s.sendACK(msg, remote, sess.Peer)
-	rtpIP, rtpPort := parseSDPRTP(extractSDP(msg))
-	if rtpPort != 0 {
-		host := remote.IP.String()
-		if rtpIP != "" && !strings.HasPrefix(rtpIP, "127.") && rtpIP != "0.0.0.0" {
-			host = rtpIP
-		}
-		if err := sess.media.SetRemote(fmt.Sprintf("%s:%d", host, rtpPort)); err != nil {
+	rtpTarget := inboundRTPTarget(remote, extractSDP(msg))
+	if rtpTarget != "" {
+		if err := sess.media.SetRemote(rtpTarget); err != nil {
 			slog.Warn("sip inbound rtp target failed", "call", callID, "err", err)
 		}
+	} else {
+		// MediaSession.WritePCMU silently drops every frame while the remote
+		// is unset, so a missing SDP used to mean a silent call with no clue.
+		slog.Warn("sip inbound answer had no usable SDP; RTP target unset", "call", callID, "remote", remote.String())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -386,7 +386,25 @@ func (s *Server) acceptInbound(sess *SIPCallSession, msg string, remote *net.UDP
 		_ = sess.Hangup()
 		return
 	}
-	slog.Info("sip inbound connected", "call", callID, "peer", sess.Peer, "rtp_remote", fmt.Sprintf("%s:%d", remote.IP, rtpPort))
+	slog.Info("sip inbound connected", "call", callID, "peer", sess.Peer, "rtp_remote", rtpTarget)
+}
+
+// inboundRTPTarget picks where to send RTP for a call the client just
+// answered: the media port from the client's SDP, but always the packet's
+// source IP. The dial path already ignored the SDP c= line — YakPhone /
+// baresip advertise a WAN or LAN address there that is unreachable from
+// this host (tailnet peers talk over 100.x) — while the answer path trusted
+// it and aimed RTP at an address that never answered, so the caller heard
+// nothing. Returns "" when the answer carried no usable media description.
+func inboundRTPTarget(remote *net.UDPAddr, sdp string) string {
+	if remote == nil {
+		return ""
+	}
+	_, port := parseSDPRTP(sdp)
+	if port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", remote.IP.String(), port)
 }
 
 // sendACK acknowledges the 200 OK that answered one of our inbound
