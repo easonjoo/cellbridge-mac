@@ -49,21 +49,70 @@ bash build_app.sh   # 生成 ~/Applications/DJiPhone Kit.app
 
 浏览器打开 <http://localhost:8080>（手机端 <http://<Mac 的 IP>>:8080/m），即可收发短信、拨打电话。
 
+## 📲 让 iPhone 变成模块的分机（CellBridge-mac）
+
+上面那套是「Mac 本地收发」。如果你想让 **iPhone 直接用模块的号码打电话、收短信**，
+用 `cellbridge-mac/` —— 它在 Mac 上跑一个 SIP 网关，YakPhone 作为 SIP 话机接入，
+来电走 CallKit 系统来电界面，短信双向同步。
+
+```bash
+./install.sh          # 一键安装：查依赖 → 拉上游 → 打补丁 → 编译网关/音频桥/控制台
+./install.sh --force  # 全部重新编译
+```
+
+装完双击 **CellBridge Console.app**（原生 AppKit 控制台）：
+
+- **顶部一键部署**：启动 / 停止 / 重启 / 重编译 / 体检 / 打开日志与目录
+- **概览**：网关、AT 桥、音频桥、语音路由、SIP 注册新鲜度、推送状态六张状态卡
+- **短信**：记录列表 + 直接发短信（走 SIP MESSAGE，与 YakPhone 同一通道）
+- **通话 / 音频 / 日志**：通话记录、音频链路实时帧率、日志尾部
+- **参数**：粘贴 YakPhone 的 PushKit token、验证推送、一键体检
+
+命令行等价物：
+
+| 命令 | 用途 |
+| --- | --- |
+| `cellbridge-mac/start_cellbridge.sh` | 启动全栈（`stop` 停止） |
+| `cellbridge-mac/doctor.sh` | 只读体检，不碰串口 |
+| `cellbridge-mac/set-push-token.sh` | 写入 PushKit token |
+| `cellbridge-mac/test-push.sh` | 不打电话验证 token 是否有效 |
+| `cellbridge-mac/rebuild-gateway.sh` | 重新编译网关（含 go test） |
+| `cellbridge-mac/send-sms.py <号码> <正文>` | 命令行发短信 |
+
+完整说明与修复记录见 [cellbridge-mac/README-mac.md](./cellbridge-mac/README-mac.md)。
+
+> ⚠️ CellBridge 与 DJiPhone Kit App **互斥**：两者都独占模块的 USB AT 接口（Interface 2），
+> `start_cellbridge.sh` 会自动先退出 App。
+
 ## 📁 项目结构
 
 ```
 DJiPhone Kit/
+├── install.sh             # 一键安装（依赖检查 → 编译网关/音频桥/控制台）
 ├── sms_server.py          # Flask 后端核心（USB 通信 + 短信 + 通话 + 流量 + GPS + 局域网鉴权）
 ├── app.py                 # pywebview 桌面壳（加载本地 UI + 菜单栏状态项）
 ├── menubar.py             # macOS 菜单栏常驻项（pyobjc NSStatusItem：信号格 + 网速）
 ├── index.html             # 桌面端前端（底部四 Tab，macOS 原生设计语言）
 ├── mobile.html            # 手机端 PWA（底部四 Tab，iOS 原生设计语言）
+├── voice_audio_bridge.swift # Mac 通话音频桥（CoreAudio 8kHz 双工）
 ├── voice_runtime.py       # 通话音频辅助
 ├── build_app.sh           # 一键打包 macOS App 脚本
 ├── sms_tool.py            # 命令行短信工具（status/send/list/read/delete）
 ├── probe_eg25g.py         # USB 设备探测脚本
 ├── diagnose_network.py    # 4G 网络诊断脚本
 ├── fix_network.py         # 4G 网络修复脚本（重启数据连接）
+├── cellbridge-mac/        # ★ iPhone 分机方案（SIP 网关 + 原生控制台）
+│   ├── CellBridgeConsole.swift  # 原生 AppKit 控制台（一键部署 + 状态 + 发短信）
+│   ├── gateway-patched/         # 上游网关的 macOS 修复补丁源码
+│   ├── rebuild-gateway.sh       # 拉上游 + 打补丁 + go test + 编译
+│   ├── start_cellbridge.sh      # 启动全栈（AT 桥 + 音频桥 + 网关）
+│   ├── at_pty_bridge.py         # USB AT ↔ PTY 串口桥
+│   ├── doctor.sh                # 只读体检
+│   ├── send-sms.py              # SIP MESSAGE 发短信
+│   ├── set-push-token.sh        # 写入 YakPhone PushKit token
+│   ├── test-push.sh             # 验证推送 token
+│   ├── build_console.sh         # 构建 CellBridge Console.app
+│   └── README-mac.md            # 移植说明 + 12 处根因修复记录
 ├── PROCESS.md             # 开发过程记录（含固件踩坑）
 ├── requirements.txt       # Python 依赖
 └── LICENSE

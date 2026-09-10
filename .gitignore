@@ -31,6 +31,13 @@ voice-runtime/
 
 # CellBridge macOS 移植：网关二进制与运行目录
 cellbridge-mac/cellbridge-gateway
+cellbridge-mac/cellbridge-gateway.new
+cellbridge-mac/cellbridge-gateway.bak-*
 cellbridge-mac/voice-audio-bridge
 .cellbridge/
 cellbridge-mac/CellBridge Console.app/
+cellbridge-mac/__pycache__/
+
+# 第三方固件 / EDL 刷机工具（121MB，含上游 GPL 工具链，与 macOS 移植无关）
+# 需要时自行获取：https://github.com/bkerler/edl
+firmware-qdc507/

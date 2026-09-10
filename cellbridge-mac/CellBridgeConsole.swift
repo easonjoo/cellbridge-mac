@@ -7,12 +7,45 @@ import SQLite3
 
 // MARK: - 常量
 
-let kDBPath = NSHomeDirectory() + "/.cellbridge/data/cellbridge.sqlite"
+/// 项目根目录解析。
+///
+/// 优先级：`CELLBRIDGE_HOME` 环境变量 → `~/.cellbridge/home`（install.sh 写入）
+///        → `.app` 所在目录（仓库内直接构建运行时） → `~/CellBridge-mac`
+///
+/// 这样同一份二进制无论放在仓库里、还是被拷到 /Applications，都能找回脚本与网关二进制。
+enum AppPaths {
+    static let home: String = {
+        let fm = FileManager.default
+        if let env = ProcessInfo.processInfo.environment["CELLBRIDGE_HOME"],
+           !env.isEmpty, fm.fileExists(atPath: env) {
+            return env
+        }
+        let stamp = NSHomeDirectory() + "/.cellbridge/home"
+        if let s = try? String(contentsOfFile: stamp, encoding: .utf8) {
+            let p = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !p.isEmpty, fm.fileExists(atPath: p) { return p }
+        }
+        // .app 位于 <repo>/CellBridge Console.app → 取其父目录
+        let parent = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
+        if fm.fileExists(atPath: parent + "/start_cellbridge.sh") { return parent }
+        return NSHomeDirectory() + "/CellBridge-mac"
+    }()
+
+    static var gatewayBin: String { home + "/cellbridge-gateway" }
+    static var audioBin: String { home + "/voice-audio-bridge" }
+    static var startScript: String { home + "/start_cellbridge.sh" }
+    static var doctorScript: String { home + "/doctor.sh" }
+    static var rebuildScript: String { home + "/rebuild-gateway.sh" }
+    static var setPushTokenScript: String { home + "/set-push-token.sh" }
+    static var testPushScript: String { home + "/test-push.sh" }
+    static var sendSMSScript: String { home + "/send-sms.py" }
+}
+
 let kRunDir = NSHomeDirectory() + "/.cellbridge/run"
 let kLogDir = kRunDir + "/logs"
 let kConfigPath = kRunDir + "/config.yaml"
-let kGatewayBin = NSHomeDirectory() + "/WorkBuddy/2026-09-04-18-44-50/mac-4g-modem/cellbridge-mac/cellbridge-gateway"
-let kAudioBin = NSHomeDirectory() + "/WorkBuddy/2026-09-04-18-44-50/mac-4g-modem/cellbridge-mac/voice-audio-bridge"
+let kDBPath = NSHomeDirectory() + "/.cellbridge/data/cellbridge.sqlite"
+let kPushTokenPath = NSHomeDirectory() + "/.cellbridge/push_token"
 let kAdbPath = NSHomeDirectory() + "/Applications/platform-tools/adb"
 let kRefreshInterval: TimeInterval = 2.0
 
@@ -228,6 +261,90 @@ final class DataStore {
         return (registered, detail)
     }
 
+    /// SIP 注册的「新鲜度」。YakPhone 会频繁重注册（expires=0 紧跟 expires=300），
+    /// 所以最后一次成功注册距今多久，直接反映 App 是否还活着：
+    ///   ≤60s  已注册 → 来电可经 SIP INVITE 直接振铃
+    ///   >300s 或本次启动后无记录 → App 已挂起 → 只能靠 VoIP 推送唤醒
+    func sipRegisterAge() -> (seconds: Int?, contact: String) {
+        guard let data = try? String(contentsOfFile: kLogDir + "/gateway.log", encoding: .utf8) else {
+            return (nil, "")
+        }
+        let lines = data.split(separator: "\n")
+        guard let bootLine = lines.first else { return (nil, "") }
+        let boot = parseLogTime(String(bootLine))
+        for line in lines.reversed() {
+            let l = String(line)
+            guard l.contains("sip register"), l.contains("expires=300") else { continue }
+            let ts = parseLogTime(l)
+            let contact = l.components(separatedBy: "contact=").last ?? ""
+            if let ts = ts {
+                return (Int(Date().timeIntervalSince1970 - ts), contact)
+            }
+            return (nil, contact)
+        }
+        _ = boot
+        return (nil, "")
+    }
+
+    /// 解析 "2026/09/10 11:30:47 INFO ..." 前缀为 Unix 时间戳
+    private func parseLogTime(_ line: String) -> TimeInterval? {
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        let df = DateFormatter()
+        df.dateFormat = "yyyy/MM/dd HH:mm:ss"
+        df.timeZone = TimeZone.current
+        return df.date(from: "\(parts[0]) \(parts[1])")?.timeIntervalSince1970
+    }
+
+    // 推送（YakPush / PushKit）状态 —— 这是「后台/锁屏来电能否唤醒 CallKit」的唯一开关
+    struct PushStatus {
+        var tokenConfigured = false
+        var tokenLength = 0
+        var inRunningConfig = false
+        var hasEvent = false
+        var lastOK = false
+        var lastEvent = ""
+    }
+
+    func pushStatus() -> PushStatus {
+        var st = PushStatus()
+        if let s = try? String(contentsOfFile: kPushTokenPath, encoding: .utf8) {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { st.tokenConfigured = true; st.tokenLength = t.count }
+        }
+        if let cfg = try? String(contentsOfFile: kConfigPath, encoding: .utf8) {
+            for raw in cfg.split(separator: "\n") {
+                let l = raw.trimmingCharacters(in: .whitespaces)
+                guard l.hasPrefix("push_token:") else { continue }
+                let v = l.replacingOccurrences(of: "push_token:", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                st.inRunningConfig = !v.isEmpty
+            }
+        }
+        let log = tailLog("gateway.log", maxBytes: 200_000)
+        for raw in log.split(separator: "\n").reversed() {
+            let l = String(raw)
+            guard l.contains("yakpush ") else { continue }
+            st.hasEvent = true
+            st.lastEvent = l
+            st.lastOK = l.contains("yakpush sent")
+            break
+        }
+        return st
+    }
+
+    /// 最近一次来电的关键事件（用于判断「手机到底响没响」）
+    func lastInboundTrace() -> [String] {
+        let log = tailLog("gateway.log", maxBytes: 200_000)
+        let keys = ["sip inbound invite sent", "sip inbound provisional", "sip inbound ringing",
+                    "sip inbound call declined", "sip inbound connected", "sip inbound answer failed",
+                    "sip inbound ring timeout", "sip bye received"]
+        return log.split(separator: "\n").map(String.init).filter { l in
+            keys.contains { l.contains($0) }
+        }.suffix(6).map { $0 }
+    }
+
     @discardableResult
     func runShell(_ cmd: String, timeout: Int = 8) -> String {
         let task = Process()
@@ -243,6 +360,165 @@ final class DataStore {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
     }
+}
+
+// MARK: - 动作层（一键部署）
+
+/// 控制台只做「调用已有脚本」，不重新实现任何逻辑。
+/// 这样命令行与 GUI 永远行为一致 —— 出问题时你可以在终端复现同一条命令。
+final class Actions {
+    static let shared = Actions()
+
+    /// 长任务串行化，避免连点两次「启动」起两份网关
+    private let queue = DispatchQueue(label: "local.cellbridge.actions")
+    private(set) var busy = false
+    /// 最近一次动作的结果（供界面提示）
+    private(set) var lastMessage = ""
+    /// 界面刷新回调（动作完成后触发）
+    var onFinish: ((String) -> Void)?
+
+    private func shell(_ cmd: String, timeout: Int) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", cmd]
+        task.currentDirectoryURL = URL(fileURLWithPath: AppPaths.home)
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do { try task.run() } catch { return "启动子进程失败：\(error.localizedDescription)" }
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        while task.isRunning && Date() < deadline { usleep(50_000) }
+        if task.isRunning { task.terminate() }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// 启动脚本内部是 `wait $GWPID` 阻塞式前台运行，必须**脱离父进程**再执行，
+    /// 否则控制台退出会把整栈带走。用 nohup + & 让 sh 立刻返回、脚本挂到 launchd 下。
+    private func launchDetached(_ script: String, log: String) {
+        let cmd = "cd '\(AppPaths.home)' && nohup ./\(script) > '\(log)' 2>&1 &"
+        _ = shell(cmd, timeout: 5)
+    }
+
+    private func begin(_ what: String) {
+        busy = true
+        lastMessage = "\(what)…"
+        DispatchQueue.main.async { self.onFinish?(self.lastMessage) }
+    }
+
+    private func finish(_ msg: String) {
+        busy = false
+        lastMessage = msg
+        DispatchQueue.main.async { self.onFinish?(msg) }
+    }
+
+    // MARK: 一键部署
+
+    func start() {
+        guard !busy else { return }
+        begin("正在启动")
+        queue.async {
+            self.launchDetached("start_cellbridge.sh", log: kRunDir + "/launcher.log")
+            // 启动脚本要起三个进程，给它几秒
+            Thread.sleep(forTimeInterval: 6)
+            let ok = DataStore.shared.gatewayRunning && DataStore.shared.ptyBridgeRunning
+            self.finish(ok ? "✓ 已启动（网关 + AT 桥 + 音频桥）"
+                           : "⚠️ 启动未完成，请看日志：\(kRunDir)/launcher.log")
+        }
+    }
+
+    func stop() {
+        guard !busy else { return }
+        begin("正在停止")
+        queue.async {
+            let out = self.shell("./start_cellbridge.sh stop", timeout: 30)
+            let ok = !DataStore.shared.gatewayRunning
+            self.finish(ok ? "✓ 已停止" : "⚠️ 仍有进程存活：\(out.suffix(200))")
+        }
+    }
+
+    func restart() {
+        guard !busy else { return }
+        begin("正在重启")
+        queue.async {
+            _ = self.shell("./start_cellbridge.sh stop", timeout: 30)
+            Thread.sleep(forTimeInterval: 2)
+            self.launchDetached("start_cellbridge.sh", log: kRunDir + "/launcher.log")
+            Thread.sleep(forTimeInterval: 6)
+            let ok = DataStore.shared.gatewayRunning && DataStore.shared.ptyBridgeRunning
+            self.finish(ok ? "✓ 已重启" : "⚠️ 重启未完成，请看 \(kRunDir)/launcher.log")
+        }
+    }
+
+    /// 重新编译网关（覆盖上游源码 + go test + go build）。不自动部署，编译产物为 .new。
+    func rebuild() {
+        guard !busy else { return }
+        begin("正在重新编译网关（约 20–60 秒）")
+        queue.async {
+            let out = self.shell("./rebuild-gateway.sh", timeout: 900)
+            if out.contains("编译完成") {
+                self.finish("✓ 编译完成：cellbridge-gateway.new\n（部署：先「停止」，再手动 mv，或跑 ./rebuild-gateway.sh 看提示）")
+            } else {
+                self.finish("✗ 编译失败：\n" + out.suffix(600))
+            }
+        }
+    }
+
+    /// 体检：跑 doctor.sh 并把完整输出回传（只读，不碰串口）
+    func doctor(completion: @escaping (String) -> Void) {
+        guard !busy else { return }
+        begin("正在体检")
+        queue.async {
+            let out = self.shell("./doctor.sh", timeout: 120)
+            self.finish("✓ 体检完成")
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    /// 推送自检：把 test-push.sh 的输出回传，不用打电话就能验证 token
+    func testPush(completion: @escaping (String) -> Void) {
+        guard !busy else { return }
+        begin("正在验证推送 token")
+        queue.async {
+            let out = self.shell("./test-push.sh", timeout: 60)
+            self.finish("✓ 推送自检完成")
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    /// 写入 PushKit token（token 只经 stdin 传给脚本，不落进命令行历史）
+    func setPushToken(_ token: String, completion: @escaping (String) -> Void) {
+        guard !busy else { return }
+        begin("正在写入推送 token")
+        queue.async {
+            let safe = token.replacingOccurrences(of: "'", with: "")
+            let out = self.shell("printf '%s' '\(safe)' | ./set-push-token.sh", timeout: 30)
+            self.finish(out.contains("已写入") ? "✓ token 已写入，重启后生效" : "✗ 写入失败：\(out)")
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    /// 发短信：走 SIP MESSAGE（与 YakPhone 完全相同的通道），不需要 API token
+    func sendSMS(to: String, body: String, completion: @escaping (String) -> Void) {
+        guard !busy else { return }
+        begin("正在发送短信")
+        queue.async {
+            let py = "/usr/bin/python3"
+            let script = AppPaths.sendSMSScript
+            let args = [py, script, to, body]
+                .map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+                .joined(separator: " ")
+            let out = self.shell(args, timeout: 60)
+            self.finish(out.contains("OK") ? "✓ 已提交发送" : "✗ 发送失败")
+            DispatchQueue.main.async { completion(out) }
+        }
+    }
+
+    // MARK: 打开位置
+
+    func openLogs()    { _ = shell("open '\(kLogDir)'", timeout: 5) }
+    func openProject() { _ = shell("open '\(AppPaths.home)'", timeout: 5) }
+    func openConfig()  { _ = shell("open -R '\(kConfigPath)'", timeout: 5) }
 }
 
 // MARK: - 工具
@@ -453,19 +729,38 @@ final class OverviewPage: NSObject, Page {
             let audioOn = ds.audioBridgeRunning
             let aStats = ds.audioStats()
             let mixer = ds.mixerRoutes()
-            let reg = ds.sipRegisterInfo()
+            let age = ds.sipRegisterAge()
+            let push = ds.pushStatus()
             let callN = ds.callCount()
             let msgN = ds.messageCount()
             let log = ds.tailLog("gateway.log", maxBytes: 4000)
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                // 注册新鲜度决定「来电走 INVITE 还是只能靠推送」
+                let regText: String
+                var regOK: Bool? = nil
+                if let s = age.seconds {
+                    if s <= 60 {
+                        regText = "YakPhone 已注册（\(s)s 前）→ 来电可直接振铃"
+                        regOK = true
+                    } else if s <= 300 {
+                        regText = "注册已 \(s)s 未刷新 → App 可能刚进后台"
+                        regOK = nil
+                    } else {
+                        regText = "注册已 \(s)s → App 已挂起，来电只能靠推送"
+                        regOK = false
+                    }
+                } else {
+                    regText = "本次启动后未见注册 → YakPhone 未连上"
+                    regOK = false
+                }
                 self.cards["gw"]?.set(
                     value: gwOn ? "运行中 · SIP :5060" : "未运行",
-                    detail: reg.registered ? "YakPhone 已注册 \(reg.detail)" : "客户端未注册",
-                    ok: gwOn ? (reg.registered ? true : nil) : false)
+                    detail: gwOn ? regText : "网关进程不存在",
+                    ok: gwOn ? (regOK ?? nil) : false)
                 self.cards["pty"]?.set(
                     value: ptyOn ? "运行中" : "未运行",
-                    detail: ptyOn ? "USB AT ↔ /dev/ttys* 已桥接" : "USB AT 口未被桥接",
+                    detail: ptyOn ? "USB AT ↔ /dev/ttys* 已桥接" : "USB AT 口未被桥接（短信/通话全废）",
                     ok: ptyOn)
                 self.cards["audio"]?.set(
                     value: audioOn ? "下行 \(aStats.rxRate) fr/s · 上行 \(aStats.txRate) fr/s" : "未运行",
@@ -482,10 +777,24 @@ final class OverviewPage: NSObject, Page {
                     value: "通话 \(callN) · 短信 \(msgN)",
                     detail: kDBPath,
                     ok: callN > 0 || msgN > 0 ? true : nil)
-                self.cards["push"]?.set(
-                    value: "未配置",
-                    detail: "APNs provider 未配置（本地使用无需推送）",
-                    ok: nil)
+                // 推送卡片：这是「锁屏/后台来电能否唤醒 CallKit」的唯一开关，不能再写死
+                if push.tokenConfigured && push.inRunningConfig {
+                    let ev = push.hasEvent ? (push.lastOK ? "最近推送被接受" : "最近推送被拒") : "尚无推送记录"
+                    self.cards["push"]?.set(
+                        value: "已配置（\(push.tokenLength) 字符）",
+                        detail: "\(ev) · 后台/锁屏来电可唤醒 CallKit",
+                        ok: push.hasEvent ? push.lastOK : true)
+                } else if push.tokenConfigured {
+                    self.cards["push"]?.set(
+                        value: "已写入但未生效",
+                        detail: "改了 token 后没重启网关 → 点顶部「重启」",
+                        ok: false)
+                } else {
+                    self.cards["push"]?.set(
+                        value: "未配置",
+                        detail: "App 在前台可振铃；挂起/锁屏来电不会有任何反应 → 见「参数」页",
+                        ok: false)
+                }
                 self.eventView.string = log
                 self.eventView.scrollToEndOfDocument(nil)
             }
@@ -537,27 +846,94 @@ final class CallsPage: NSObject, Page {
 final class MessagesPage: NSObject, Page {
     let table: SimpleTable
     let countLabel = NSTextField(labelWithString: "")
+    private let toField = NSTextField(string: "")
+    private let bodyField = NSTextField(string: "")
+    private let sendButton = NSButton(title: "发送", target: nil, action: nil)
+    private let hint = NSTextField(labelWithString: "")
+    private let spinner = NSProgressIndicator()
+
     var view: NSView {
         let v = NSView()
         countLabel.font = NSFont.systemFont(ofSize: 11)
         countLabel.textColor = .secondaryLabelColor
-        countLabel.translatesAutoresizingMaskIntoConstraints = false
-        table.scroll.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(countLabel)
-        v.addSubview(table.scroll)
+
+        let bar = NSStackView()
+        bar.orientation = .horizontal
+        bar.spacing = 8
+        toField.placeholderString = "对方号码"
+        toField.font = NSFont.systemFont(ofSize: 12)
+        toField.translatesAutoresizingMaskIntoConstraints = false
+        toField.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        bodyField.placeholderString = "短信正文（支持中文）"
+        bodyField.font = NSFont.systemFont(ofSize: 12)
+        bodyField.translatesAutoresizingMaskIntoConstraints = false
+        bodyField.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        sendButton.target = self
+        sendButton.action = #selector(sendTapped)
+        sendButton.bezelStyle = .rounded
+        sendButton.keyEquivalent = "\r"
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        [toField, bodyField, sendButton, spinner].forEach { bar.addArrangedSubview($0) }
+
+        let note = NSTextField(labelWithString:
+            "发送走 SIP MESSAGE —— 与 YakPhone 发短信完全同一条通道（不需要 API token）。中文自动走 PDU 编码。")
+        note.font = NSFont.systemFont(ofSize: 10.5)
+        note.textColor = .tertiaryLabelColor
+
+        [countLabel, table.scroll, bar, hint, note].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            v.addSubview($0)
+        }
         NSLayoutConstraint.activate([
             countLabel.topAnchor.constraint(equalTo: v.topAnchor, constant: 14),
             countLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+
             table.scroll.topAnchor.constraint(equalTo: countLabel.bottomAnchor, constant: 8),
             table.scroll.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
             table.scroll.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
-            table.scroll.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -16),
+
+            bar.topAnchor.constraint(equalTo: table.scroll.bottomAnchor, constant: 12),
+            bar.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+            hint.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 6),
+            hint.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+            hint.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
+            note.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 4),
+            note.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+            note.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -14),
         ])
         return v
     }
+
     override init() {
         table = SimpleTable(headers: ["方向", "号码", "状态", "时间", "内容"], widths: [56, 120, 90, 150, 420])
     }
+
+    @objc private func sendTapped() {
+        let to = toField.stringValue.trimmingCharacters(in: .whitespaces)
+        let body = bodyField.stringValue
+        guard !to.isEmpty, !body.isEmpty else {
+            hint.stringValue = "号码与正文都不能为空"
+            return
+        }
+        sendButton.isEnabled = false
+        spinner.startAnimation(nil)
+        hint.stringValue = "正在发送到 \(to) …"
+        Actions.shared.sendSMS(to: to, body: body) { [weak self] out in
+            guard let self = self else { return }
+            self.spinner.stopAnimation(nil)
+            self.sendButton.isEnabled = true
+            let ok = out.contains("OK")
+            self.hint.stringValue = ok ? "✓ 已提交，稍后在此列表看到「发出」记录"
+                                       : "✗ 失败：\(out.suffix(200))"
+            if ok { self.bodyField.stringValue = "" }
+            self.refresh()
+        }
+    }
+
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let rows = DataStore.shared.messages().map { m -> [String] in
@@ -567,7 +943,7 @@ final class MessagesPage: NSObject, Page {
             }
             DispatchQueue.main.async {
                 self?.table.update(rows)
-                self?.countLabel.stringValue = "共 \(rows.count) 条短信记录（最新在前，dry-run=false 即真实收发）"
+                self?.countLabel.stringValue = "共 \(rows.count) 条短信记录（最新在前）"
             }
         }
     }
@@ -733,23 +1109,115 @@ extension NSTextView {
     }
 }
 
+// MARK: - 输出窗口（体检 / 推送自检结果）
+
+final class OutputWindow {
+    static let shared = OutputWindow()
+    private var window: NSWindow?
+    private var textView: NSTextView?
+
+    func show(title: String, text: String) {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 580),
+                             styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                             backing: .buffered, defer: false)
+            let tv = NSTextView()
+            tv.isEditable = false
+            tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            tv.autoresizingMask = [.width]
+            tv.isVerticallyResizable = true
+            tv.textContainer?.widthTracksTextView = true
+            let sv = NSScrollView()
+            sv.documentView = tv
+            sv.hasVerticalScroller = true
+            sv.autoresizingMask = [.width, .height]
+            sv.frame = w.contentView!.bounds
+            w.contentView?.addSubview(sv)
+            window = w
+            textView = tv
+        }
+        window?.title = title
+        textView?.string = text
+        textView?.scrollToBeginningOfDocument(nil)
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 // 参数页
 final class ConfigPage: NSObject, Page {
     private let configTable: SimpleTable
     private let note = NSTextField(wrappingLabelWithString: "")
+    private let tokenField = NSSecureTextField(string: "")
+    private let pushState = NSTextField(wrappingLabelWithString: "")
+    private let saveButton = NSButton(title: "写入并重启", target: nil, action: nil)
+    private let verifyButton = NSButton(title: "验证推送", target: nil, action: nil)
+    private let doctorButton = NSButton(title: "一键体检", target: nil, action: nil)
+    private let spinner = NSProgressIndicator()
 
     var view: NSView {
         let v = NSView()
+
+        let pushTitle = NSTextField(labelWithString: "CallKit 唤醒（YakPhone PushKit token）")
+        pushTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+
+        let pushNote = NSTextField(wrappingLabelWithString:
+            "iOS 只允许 VoIP 推送（PushKit）在 App 挂起/锁屏时唤醒 CallKit。"
+            + "token 在 YakPhone → 设置 → 推送 / Push（PushKit、APNs Token）里复制。"
+            + "不填的后果：App 在前台可振铃，挂起/锁屏来电毫无反应。")
+        pushNote.font = NSFont.systemFont(ofSize: 11)
+        pushNote.textColor = .secondaryLabelColor
+
+        tokenField.placeholderString = "粘贴 PushKit token（形如 AAA…== 的 Base64 串）"
+        tokenField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        tokenField.translatesAutoresizingMaskIntoConstraints = false
+        tokenField.widthAnchor.constraint(equalToConstant: 380).isActive = true
+
+        saveButton.target = self; saveButton.action = #selector(saveToken)
+        saveButton.bezelStyle = .rounded
+        verifyButton.target = self; verifyButton.action = #selector(verifyPush)
+        verifyButton.bezelStyle = .rounded
+        doctorButton.target = self; doctorButton.action = #selector(runDoctor)
+        doctorButton.bezelStyle = .rounded
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+
+        let row = NSStackView(views: [tokenField, saveButton, verifyButton, doctorButton, spinner])
+        row.orientation = .horizontal
+        row.spacing = 8
+
+        pushState.font = NSFont.systemFont(ofSize: 11)
+        pushState.textColor = .secondaryLabelColor
+
         note.font = NSFont.systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
-        configTable.scroll.translatesAutoresizingMaskIntoConstraints = false
-        note.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(note)
-        v.addSubview(configTable.scroll)
+        note.stringValue = "以下来自 ~/.cellbridge/run/config.yaml 与运行环境（只读展示）"
+
+        [pushTitle, pushNote, row, pushState, note, configTable.scroll].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            v.addSubview($0)
+        }
         NSLayoutConstraint.activate([
-            note.topAnchor.constraint(equalTo: v.topAnchor, constant: 14),
+            pushTitle.topAnchor.constraint(equalTo: v.topAnchor, constant: 16),
+            pushTitle.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+
+            pushNote.topAnchor.constraint(equalTo: pushTitle.bottomAnchor, constant: 6),
+            pushNote.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+            pushNote.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
+
+            row.topAnchor.constraint(equalTo: pushNote.bottomAnchor, constant: 10),
+            row.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+
+            pushState.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 8),
+            pushState.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
+            pushState.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
+
+            note.topAnchor.constraint(equalTo: pushState.bottomAnchor, constant: 16),
             note.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
             note.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
+
             configTable.scroll.topAnchor.constraint(equalTo: note.bottomAnchor, constant: 8),
             configTable.scroll.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 24),
             configTable.scroll.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -24),
@@ -760,19 +1228,80 @@ final class ConfigPage: NSObject, Page {
 
     override init() {
         configTable = SimpleTable(headers: ["配置项", "值"], widths: [240, 500])
-        note.stringValue = "来自 ~/.cellbridge/run/config.yaml 与运行环境（只读展示）"
+    }
+
+    @objc private func saveToken() {
+        let t = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { pushState.stringValue = "请先粘贴 token"; return }
+        saveButton.isEnabled = false; spinner.startAnimation(nil)
+        pushState.stringValue = "正在写入并重启网关…"
+        Actions.shared.setPushToken(t) { [weak self] out in
+            guard let self = self else { return }
+            self.tokenField.stringValue = ""
+            Actions.shared.restart()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
+                self.saveButton.isEnabled = true
+                self.spinner.stopAnimation(nil)
+                self.pushState.stringValue = out.contains("已写入")
+                    ? "✓ token 已写入并已重启。建议接着点「验证推送」。"
+                    : "✗ \(out.suffix(200))"
+                self.refresh()
+            }
+        }
+    }
+
+    @objc private func verifyPush() {
+        verifyButton.isEnabled = false; spinner.startAnimation(nil)
+        pushState.stringValue = "正在向 push.yakteam.com 发一条测试推送…"
+        Actions.shared.testPush { [weak self] out in
+            guard let self = self else { return }
+            self.verifyButton.isEnabled = true
+            self.spinner.stopAnimation(nil)
+            self.pushState.stringValue = out.contains("已被端点接受")
+                ? "✓ 推送被接受 —— 若手机仍不响，问题在 App/系统侧（通知权限、专注模式、后台清理）"
+                : "见弹窗里的详细判读"
+            OutputWindow.shared.show(title: "推送 token 验证结果", text: out)
+        }
+    }
+
+    @objc private func runDoctor() {
+        doctorButton.isEnabled = false; spinner.startAnimation(nil)
+        pushState.stringValue = "正在体检（只读检查，不碰串口）…"
+        Actions.shared.doctor { [weak self] out in
+            guard let self = self else { return }
+            self.doctorButton.isEnabled = true
+            self.spinner.stopAnimation(nil)
+            self.pushState.stringValue = "体检完成，见弹窗"
+            OutputWindow.shared.show(title: "CellBridge 体检报告", text: out)
+        }
     }
 
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let ds = DataStore.shared
+            let push = ds.pushStatus()
             var rows: [[String]] = ds.loadConfig().map { ($0.0, $0.1) }.map { [$0.0, $0.1] }
-            rows.append(["二进制 · 网关", kGatewayBin])
-            rows.append(["二进制 · 音频桥", kAudioBin])
+            rows.append(["项目根目录", AppPaths.home])
+            rows.append(["二进制 · 网关", AppPaths.gatewayBin + (FileManager.default.fileExists(atPath: AppPaths.gatewayBin) ? "（存在）" : "（缺失，需先编译）")])
+            rows.append(["二进制 · 音频桥", AppPaths.audioBin + (FileManager.default.fileExists(atPath: AppPaths.audioBin) ? "（存在）" : "（缺失）")])
             rows.append(["数据库", kDBPath])
             rows.append(["日志目录", kLogDir])
+            rows.append(["PushKit token 文件", push.tokenConfigured ? "已写入（\(push.tokenLength) 字符）" : "未写入"])
+            rows.append(["token 是否已进运行配置", push.inRunningConfig ? "是" : "否（需重启网关）"])
+            if push.hasEvent { rows.append(["最近一次推送日志", push.lastEvent]) }
             rows.append(["adb 工具", kAdbPath + (FileManager.default.fileExists(atPath: kAdbPath) ? "（存在）" : "（不存在，mixer 状态将不可查）")])
-            DispatchQueue.main.async { self?.configTable.update(rows) }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.configTable.update(rows)
+                if !self.saveButton.isEnabled { return }   // 动作进行中不覆盖提示
+                if push.tokenConfigured && push.inRunningConfig {
+                    self.pushState.stringValue = "当前状态：已配置且已生效 ✓"
+                } else if push.tokenConfigured {
+                    self.pushState.stringValue = "当前状态：token 已写入但未生效 → 点「写入并重启」"
+                } else {
+                    self.pushState.stringValue = "当前状态：未配置 → 挂起/锁屏来电不会振铃"
+                }
+            }
         }
     }
 }
@@ -784,6 +1313,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var sidebarStack: NSStackView!
     var sidebarButtons: [NSButton] = []
     var contentContainer: NSView!
+    var pageHost: NSView!
+    var statusLabel: NSTextField!
     var pages: [Page] = []
     var titles: [String] = []
     var currentIndex = 0
@@ -800,13 +1331,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         titles = ["概览", "通话", "短信", "音频", "日志", "参数"]
 
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "CellBridge Console"
         window.delegate = self
         window.titlebarAppearsTransparent = false
-        window.minSize = NSSize(width: 820, height: 560)
+        window.minSize = NSSize(width: 900, height: 620)
 
         // 布局：侧栏 + 内容
         let sidebar = NSVisualEffectView()
@@ -824,6 +1355,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         contentContainer = NSView()
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        // ── 顶部控制条：一键部署 ──────────────────────────────
+        // 只调已有脚本，不重新实现逻辑：命令行能复现同一条命令。
+        let controlBar = NSVisualEffectView()
+        controlBar.material = .headerView
+        controlBar.blendingMode = .withinWindow
+        controlBar.state = .active
+        controlBar.translatesAutoresizingMaskIntoConstraints = false
+
+        let barStack = NSStackView()
+        barStack.orientation = .horizontal
+        barStack.spacing = 6
+        barStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let controls: [(String, String, Selector)] = [
+            ("启动",   "play.fill",         #selector(actStart)),
+            ("停止",   "stop.fill",         #selector(actStop)),
+            ("重启",   "arrow.clockwise",   #selector(actRestart)),
+            ("重编译", "hammer",            #selector(actRebuild)),
+            ("体检",   "stethoscope",       #selector(actDoctor)),
+            ("日志",   "doc.text",          #selector(actLogs)),
+            ("目录",   "folder",            #selector(actProject)),
+        ]
+        for (title, symbol, sel) in controls {
+            let b = NSButton(title: title, target: self, action: sel)
+            b.bezelStyle = .rounded
+            b.font = NSFont.systemFont(ofSize: 12)
+            b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            b.imagePosition = .imageLeading
+            b.translatesAutoresizingMaskIntoConstraints = false
+            barStack.addArrangedSubview(b)
+        }
+        statusLabel = NSTextField(labelWithString: "就绪")
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        barStack.addArrangedSubview(statusLabel)
+        controlBar.addSubview(barStack)
+
+        pageHost = NSView()
+        pageHost.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.addSubview(controlBar)
+        contentContainer.addSubview(pageHost)
 
         let title = NSTextField(labelWithString: "CellBridge")
         title.font = NSFont.systemFont(ofSize: 15, weight: .bold)
@@ -850,6 +1425,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             contentContainer.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor),
             contentContainer.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             contentContainer.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor),
+
+            controlBar.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            controlBar.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            controlBar.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            controlBar.heightAnchor.constraint(equalToConstant: 44),
+
+            barStack.centerYAnchor.constraint(equalTo: controlBar.centerYAnchor),
+            barStack.leadingAnchor.constraint(equalTo: controlBar.leadingAnchor, constant: 16),
+            barStack.trailingAnchor.constraint(lessThanOrEqualTo: controlBar.trailingAnchor, constant: -16),
+
+            pageHost.topAnchor.constraint(equalTo: controlBar.bottomAnchor),
+            pageHost.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            pageHost.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            pageHost.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
         ])
 
         for (i, t) in titles.enumerated() {
@@ -874,22 +1463,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: kRefreshInterval, repeats: true) { [weak self] _ in
             self?.refreshCurrent()
         }
+        Actions.shared.onFinish = { [weak self] msg in
+            self?.statusLabel.stringValue = msg.replacingOccurrences(of: "\n", with: " · ")
+        }
         refreshCurrent()
+    }
+
+    // MARK: 控制条动作
+
+    @objc private func actStart()   { Actions.shared.start() }
+    @objc private func actStop()    { Actions.shared.stop() }
+    @objc private func actRestart() { Actions.shared.restart() }
+    @objc private func actRebuild() { Actions.shared.rebuild() }
+    @objc private func actLogs()    { Actions.shared.openLogs() }
+    @objc private func actProject() { Actions.shared.openProject() }
+
+    @objc private func actDoctor() {
+        statusLabel.stringValue = "正在体检…"
+        Actions.shared.doctor { out in
+            OutputWindow.shared.show(title: "CellBridge 体检报告", text: out)
+        }
     }
 
     @objc private func sidebarTap(_ sender: NSButton) { selectPage(sender.tag) }
 
     private func selectPage(_ idx: Int) {
         currentIndex = idx
-        contentContainer.subviews.forEach { $0.removeFromSuperview() }
+        pageHost.subviews.forEach { $0.removeFromSuperview() }
         let pv = pages[idx].view
         pv.translatesAutoresizingMaskIntoConstraints = false
-        contentContainer.addSubview(pv)
+        pageHost.addSubview(pv)
         NSLayoutConstraint.activate([
-            pv.topAnchor.constraint(equalTo: contentContainer.topAnchor),
-            pv.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
-            pv.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-            pv.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            pv.topAnchor.constraint(equalTo: pageHost.topAnchor),
+            pv.bottomAnchor.constraint(equalTo: pageHost.bottomAnchor),
+            pv.leadingAnchor.constraint(equalTo: pageHost.leadingAnchor),
+            pv.trailingAnchor.constraint(equalTo: pageHost.trailingAnchor),
         ])
         for (i, b) in sidebarButtons.enumerated() {
             b.layer?.cornerRadius = 6
