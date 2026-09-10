@@ -367,6 +367,12 @@ recording:
   enabled: false
 EOF
 
+# Linphone 锁屏来电推送（FlexiAPI x-api-key，见 set-linphone-push.sh）
+if [ -f "$HOME/.cellbridge/linphone_push_key" ]; then
+  export CB_LINPHONE_PUSH_KEY="$(head -1 "$HOME/.cellbridge/linphone_push_key" | tr -d '[:space:]')"
+  [ -f "$HOME/.cellbridge/linphone_push_url" ] && export CB_LINPHONE_PUSH_URL="$(head -1 "$HOME/.cellbridge/linphone_push_url" | tr -d '[:space:]')"
+fi
+
 "$GATEWAY" -config "$RUN/config.yaml" > "$LOG/gateway.log" 2>&1 &
 GWPID=$!
 

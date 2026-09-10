@@ -27,6 +27,12 @@ type Server struct {
 	sendSMS    func(ctx context.Context, to, body string) error
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// Linphone 锁屏来电推送（linphone_push.go）
+	linphonePushKey string
+	linphonePushURL string
+	pushMu          sync.Mutex
+	pushRegs        map[string]pushParams
 }
 
 func NewServer(listenAddr string, registrar *Registrar, auth *Auth, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio) *Server {
@@ -39,6 +45,13 @@ func NewServer(listenAddr string, registrar *Registrar, auth *Auth, modemCtl *mo
 func (s *Server) AttachEvents(events <-chan modem.ModemEvent, pushToken string) {
 	s.events = events
 	s.pushToken = pushToken
+}
+
+// SetLinphonePush 配置 Linphone 锁屏来电推送（FlexiAPI 的 x-api-key）。
+// key 为空 = 功能关闭，行为与旧版完全一致。
+func (s *Server) SetLinphonePush(key, url string) {
+	s.linphonePushKey = key
+	s.linphonePushURL = url
 }
 
 // AttachSMS wires the SMS engine so SIP MESSAGE requests from the phone
@@ -201,6 +214,15 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 		return
 	}
 	sent := 0
+	// Linphone 休眠时收不到 UDP INVITE：先推一把把它唤醒（弹 CallKit →
+	// 重新 REGISTER），并把重试窗口从 5s 拉到 20s，等新注册一出现，
+	// 下一轮循环立即把 INVITE 送到新地址。前台客户端不受影响——
+	// 第一轮就送达，后续重试因 sent>0 不再执行。
+	pushSent := s.wakeLinphoneClients(callID)
+	attempts := inboundInviteAttempts
+	if pushSent {
+		attempts = inboundInvitePushAttempts
+	}
 	// Branch and From-tag of this INVITE. They are derived from the call id
 	// so that a CANCEL sent later (the far end gave up before the phone was
 	// picked up) reuses the very branch the client is showing.
@@ -214,7 +236,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	// for a CallKit call whose URI pointed at the phone itself. Prefer the
 	// interface used to reach the registered client.
 	reachable := ""
-	for attempt := 0; attempt < inboundInviteAttempts && sent == 0; attempt++ {
+	for attempt := 0; attempt < attempts && sent == 0; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-sess.ctx.Done():
@@ -302,6 +324,10 @@ const inboundRingTimeout = 45 * time.Second
 const (
 	inboundInviteAttempts   = 10
 	inboundInviteRetryDelay = 500 * time.Millisecond
+
+	// 发过 Linphone 推送后的重试预算：App 冷启动 + 重新 REGISTER 通常
+	// 1~5s，留 20s 覆盖弱网/旧机型（与 45s 振铃超时留有余量）。
+	inboundInvitePushAttempts = 40
 )
 
 // contactAddr extracts host:port from a SIP Contact header value.
@@ -589,6 +615,14 @@ func (s *Server) handleRegister(msg string, remote *net.UDPAddr) {
 		expires = 0
 	}
 	s.registrar.Register(username, contact, "UDP", expires)
+	// 记录/清除该注册的 RFC 8599 推送参数（Linphone 锁屏来电用）。
+	// YakPhone 不带 pn-*，存不进去也无妨。
+	if pp, ok := parsePushParams(contact); ok {
+		s.storePushParams(username, pp, expires)
+		slog.Info("sip register push params", "user", username, "provider", pp.Provider, "param", pp.Param, "prid_len", len(pp.Prid))
+	} else if expires <= 0 {
+		s.storePushParams(username, pushParams{}, 0)
+	}
 	s.sendResponse(remote, msg, 200, "OK", "Contact: "+contact+"\r\nExpires: "+fmt.Sprintf("%d", expires)+"\r\n", "")
 	slog.Info("sip register", "user", username, "contact", contact, "expires", expires)
 }

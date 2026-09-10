@@ -309,6 +309,13 @@ func main() {
 			sipServer := sip.NewServer(settings.SIP.Listen, registrar, sipAuth, callModem, application.VoiceAudio)
 			application.YakPushToken = settings.SIP.PushToken
 			sipServer.AttachEvents(sipEvents, settings.SIP.PushToken)
+			// Linphone 锁屏来电推送：Key 走环境变量（不经上游 config 结构），
+			// 由 start_cellbridge.sh 从 ~/.cellbridge/linphone_push_key 注入。
+			// 可选 CB_LINPHONE_PUSH_URL 覆盖默认的 subscribe.linphone.org。
+			if lpKey := os.Getenv("CB_LINPHONE_PUSH_KEY"); lpKey != "" {
+				sipServer.SetLinphonePush(lpKey, os.Getenv("CB_LINPHONE_PUSH_URL"))
+				slog.Info("linphone push enabled", "url", sip.LinphonePushURL(os.Getenv("CB_LINPHONE_PUSH_URL")))
+			}
 			if application.SMSEngine != nil {
 				sipServer.AttachSMS(func(ctx context.Context, to, body string) error {
 					_, err := application.SMSEngine.Send(ctx, to, body)
