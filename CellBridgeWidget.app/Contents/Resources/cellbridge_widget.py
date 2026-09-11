@@ -89,6 +89,14 @@ def collect():
     if mb is None:
         code, pid = sh(ADB + " shell pidof mavo-pcm-bridge 2>/dev/null", timeout=8)
         mb = {"ok": code == 0 and bool(pid.strip()), "pid": pid.strip() or None}
+        if not mb["ok"]:
+            try:
+                dbg = subprocess.run(ADB + " shell pidof mavo-pcm-bridge", shell=True,
+                                     capture_output=True, text=True, timeout=8)
+                open("/tmp/widget_adb_debug.log", "a").write(
+                    "code=%s out=%r err=%r\n" % (dbg.returncode, dbg.stdout, dbg.stderr))
+            except Exception as e:
+                open("/tmp/widget_adb_debug.log", "a").write("exc=%r\n" % (e,))
     d["module_bridge"] = mb
 
     d["now"] = int(time.time())

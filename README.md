@@ -66,7 +66,7 @@ cd cellbridge-mac
 |---|---|
 | SIP 服务器 | Mac 的局域网 IP（或 Tailscale IP `100.x.y.z`）+ 端口 `5060` |
 | 用户名 | `iphone` |
-| 密码 | `cellbridge-<你的Mac用户名>`（如 `cellbridge-idoer`） |
+| 密码 | 由 `cellbridge.secrets.env` 注入（模板见 `cellbridge.secrets.env.example`）。请改用强随机口令，切勿写进仓库或脚本 |
 | 传输 | UDP |
 
 填好后注册成功，即可：

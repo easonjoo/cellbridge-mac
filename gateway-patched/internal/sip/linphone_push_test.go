@@ -37,7 +37,7 @@ func TestParsePushParamsLegacy(t *testing.T) {
 
 func TestParsePushParamsAbsent(t *testing.T) {
 	// YakPhone / 普通 SIP 客户端：没有 pn-*，绝不能误报
-	contact := `<sip:iphone@192.168.31.14:5060>`
+	contact := `<sip:iphone@192.168.1.50:5060>`
 	if _, ok := parsePushParams(contact); ok {
 		t.Fatal("expected no push params")
 	}
@@ -56,5 +56,32 @@ func TestSanitizeCallID(t *testing.T) {
 	}
 	if got := sanitizeCallID("in-a@b.c"); got != "in-a-b-c" {
 		t.Errorf("sanitizeCallID at-sign = %q", got)
+	}
+}
+
+func TestCleanPushParam(t *testing.T) {
+	// Linphone 上报的 pn-param 带 &remote 后缀，FlexiAPI 只收字母数字/点/下划线
+	if got := cleanPushParam("ABCD1234.org.linphone.phone.voip&remote"); got != "ABCD1234.org.linphone.phone.voip" {
+		t.Errorf("cleanPushParam &remote = %q", got)
+	}
+	if got := cleanPushParam("org.linphone.phone.voip"); got != "org.linphone.phone.voip" {
+		t.Errorf("cleanPushParam plain = %q", got)
+	}
+}
+
+func TestPickCallPrid(t *testing.T) {
+	voip := "574946470F13CCFDC3B585DE2150D30640FB81F7A62A0C8FEC3823BE0D0F8CCF:voip"
+	remote := "dd99b4bd553945beded0d810b845bc592ff58e2197d3cd0d219e5bdb6106bab1:remote"
+	// 双 token 合并上报：必须选 :voip 那个，且去掉 &
+	if got := pickCallPrid(voip + "&" + remote); got != voip {
+		t.Errorf("pickCallPrid dual = %q, want voip token", got)
+	}
+	// 单 token 原样保留
+	if got := pickCallPrid(voip); got != voip {
+		t.Errorf("pickCallPrid single = %q", got)
+	}
+	// 多 token 但都没有 :voip 后缀 → 回退第一个
+	if got := pickCallPrid(remote + "&other:x"); got != remote {
+		t.Errorf("pickCallPrid fallback = %q", got)
 	}
 }

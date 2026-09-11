@@ -86,8 +86,46 @@ def main():
     # 桥自身不读它，因此不存在数据竞争。
     log(f'PTY 从端: {slave_path}')
 
-    dev = open_usb()
-    flush_usb(dev)
+    # --- USB 断链自愈 ---------------------------------------------------
+    # 模块重启（adb reboot / 掉电）后 USB 重新枚举，旧句柄永久失效，此前
+    # 表现为桥对着死句柄无限重试（"No such device" 狂刷），AT 命令全部
+    # 无响应，只能手动重启整套服务。现在检测到设备消失即重新枚举、重占
+    # 接口，PTTY 从端路径不变，网关无需重启。
+    dev_lock = threading.Lock()
+    holder = {'dev': None}
+    healing = threading.Event()
+
+    def current_dev():
+        with dev_lock:
+            return holder['dev']
+
+    def is_disconnect(e):
+        text = str(e).lower()
+        return ('no such device' in text or 'disconnected' in text
+                or 'nodev' in text or 'shut down' in text)
+
+    def try_reopen(reason):
+        # 只允许一个线程做自愈；其余线程等到自愈完成直接用新句柄。
+        if healing.is_set():
+            healing.wait()
+            return
+        healing.set()
+        try:
+            with dev_lock:
+                old = holder['dev']
+                try:
+                    usb.util.dispose_resources(old)
+                except Exception:
+                    pass
+                log(f'USB 断链自愈（{reason}）：重新枚举模块…')
+                holder['dev'] = open_usb()
+                flush_usb(holder['dev'])
+                log('USB 断链自愈完成')
+        finally:
+            healing.clear()
+
+    holder['dev'] = open_usb()
+    flush_usb(holder['dev'])
 
     print(slave_path, flush=True)  # 启动脚本读这一行（清空之后才公布，避免读到残留）
 
@@ -105,11 +143,16 @@ def main():
         nonlocal uplink_failures
         while True:
             try:
-                chunk = bytes(dev.read(EP_IN, 512, timeout=300))
-            except usb.core.USBError:
+                chunk = bytes(current_dev().read(EP_IN, 512, timeout=300))
+            except usb.core.USBError as e:
+                if is_disconnect(e):
+                    try_reopen('上行读到设备消失')
                 continue
-            except Exception:
-                time.sleep(1)
+            except Exception as e:
+                if is_disconnect(e):
+                    try_reopen('上行读到设备消失')
+                else:
+                    time.sleep(1)
                 continue
             if not chunk:
                 continue
@@ -139,10 +182,13 @@ def main():
                 continue
             trace_line('Mac→模块', data)
             try:
-                dev.write(EP_OUT, data, timeout=3000)
+                current_dev().write(EP_OUT, data, timeout=3000)
             except Exception as e:
-                log(f'USB 写失败: {e}')
-                time.sleep(0.5)
+                if is_disconnect(e):
+                    try_reopen('下行写入设备消失')
+                else:
+                    log(f'USB 写失败: {e}')
+                    time.sleep(0.5)
 
     threading.Thread(target=usb2pty, daemon=True).start()
     threading.Thread(target=pty2usb, daemon=True).start()

@@ -33,8 +33,10 @@ type Adapter struct {
 	pendingPeer  string
 	incomingSent bool
 	clipOnce     sync.Once
-	capMu        sync.RWMutex
-	caps         modem.Capabilities
+	// lastResistLog 给"幽灵上下文清不掉"的告警限频（一分钟一次）。
+	lastResistLog time.Time
+	capMu         sync.RWMutex
+	caps          modem.Capabilities
 	events       chan modem.ModemEvent
 	close        sync.Once
 }
@@ -125,6 +127,56 @@ func (a *Adapter) Status(ctx context.Context) (modem.LineStatus, error) {
 	}
 	a.mu.Unlock()
 	return status, nil
+}
+
+// Temperature reads the module's internal temperature via AT. Different
+// firmware exposes it differently (Quectel EG25-G uses AT+QTEMP, some QDC507
+// builds AT+CPUTEMP?), so we try each and parse the first decimal. A 24/7
+// cellular gateway runs hot in an enclosure; an overheated module throttles
+// RF and drops calls, so thermalMonitor (main.go) logs it every 30s and the
+// console/doctor surface it.
+func (a *Adapter) Temperature(ctx context.Context) (tempC float64, source string, err error) {
+	if a.client == nil {
+		return 0, "", fmt.Errorf("AT client is unavailable")
+	}
+	for _, cmd := range []string{"AT+QTEMP", "AT+CPUTEMP?"} {
+		lines, exErr := a.client.Exchange(ctx, cmd)
+		if exErr != nil {
+			continue
+		}
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if !strings.Contains(line, "TEMP") {
+				continue
+			}
+			if t, ok := firstTempNumber(line); ok {
+				return t, cmd, nil
+			}
+		}
+	}
+	return 0, "", fmt.Errorf("modem temperature not reported by AT+QTEMP/AT+CPUTEMP?")
+}
+
+// firstTempNumber extracts the first signed decimal from a URC such as
+// "+QTEMP: 42" or "CPUTEMP: 38.5".
+func firstTempNumber(s string) (float64, bool) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || c == '-' || c == '+' {
+			j := i
+			for j < len(s) && (s[j] == '-' || s[j] == '+' || (s[j] >= '0' && s[j] <= '9') || s[j] == '.') {
+				j++
+			}
+			if j > i {
+				var f float64
+				if _, e := fmt.Sscanf(s[i:j], "%f", &f); e == nil {
+					return f, true
+				}
+			}
+			i = j
+		}
+	}
+	return 0, false
 }
 
 // WaitReady polls the AT channel until the modem answers "AT" with
@@ -323,6 +375,97 @@ func (a *Adapter) DeleteSMS(ctx context.Context, storageIndex string) error {
 }
 
 func (a *Adapter) Events() <-chan modem.ModemEvent { return a.events }
+
+// ReapGhosts scans AT+CLCC and, when any call context sits in an active,
+// dialing, alerting, incoming or waiting state, sends ATH to clear them.
+// It is the janitor for teardown races: a CANCEL/BYE that lands while the
+// cellular leg is mid-dial can lose the race against the module completing
+// the call, leaving a connected call with no SIP session owning it (seen
+// 2026-09-11: a cancelled dial answered afterwards and stuck as an empty
+// CLCC context until reboot). Returns the number of ghost contexts found.
+// Only call this when no SIP session should own the line.
+func (a *Adapter) ReapGhosts(ctx context.Context) (int, error) {
+	lines, err := a.client.Exchange(ctx, "AT+CLCC")
+	if err != nil {
+		return 0, err
+	}
+	ghosts := 0
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "+CLCC:") {
+			continue
+		}
+		fields := strings.Split(strings.TrimPrefix(line, "+CLCC:"), ",")
+		if len(fields) < 3 {
+			continue
+		}
+		state, stateErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if stateErr != nil {
+			continue
+		}
+		// 0=active 2=dialing(MO) 3=alerting(MO) 4=incoming(MT) 5=waiting
+		switch state {
+		case 0, 2, 3, 4, 5:
+			ghosts++
+		}
+	}
+	if ghosts == 0 {
+		return 0, nil
+	}
+	// 指令阶梯：本模块对残留上下文不认 ATH（实测返回 OK 但 CLCC 纹丝不动），
+	// 逐级升级并在每级后复查，清干净即停。CHUP 是 Quectel 风格的全挂断；
+	// CHLD=1/0 兜底释放 active/held。
+	ladder := []string{"ATH", "AT+CHUP", "AT+CHLD=1", "AT+CHLD=0"}
+	var lastErr error
+	for _, cmd := range ladder {
+		if _, lastErr = a.client.Exchange(ctx, cmd); lastErr != nil {
+			continue
+		}
+		time.Sleep(800 * time.Millisecond) // 给 RIL 一点落地时间
+		lines, err = a.client.Exchange(ctx, "AT+CLCC")
+		if err != nil {
+			return ghosts, err
+		}
+		if !clccHasLiveContext(lines) {
+			slog.Info("modem ghost calls cleared", "contexts", ghosts, "cmd", cmd)
+			return ghosts, nil
+		}
+	}
+	// 抵抗的幽灵是模块 AT 层的顽固缓存（实测 ATH/CHUP/CHLD 全部 ERROR，
+	// 仅重启模块可清），不占音频路由也不阻塞拨号——降噪：一分钟最多记一次。
+	a.mu.Lock()
+	first := a.lastResistLog.IsZero() || time.Since(a.lastResistLog) >= time.Minute
+	if first {
+		a.lastResistLog = time.Now()
+	}
+	a.mu.Unlock()
+	if first {
+		slog.Warn("modem ghost calls resist clearing (module reboot clears)", "contexts", ghosts, "last_err", lastErr)
+	}
+	return ghosts, lastErr
+}
+
+// clccHasLiveContext reports whether any +CLCC line is a call context in an
+// active/dialing/alerting/incoming/waiting state.
+func clccHasLiveContext(lines []string) bool {
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "+CLCC:") {
+			continue
+		}
+		fields := strings.Split(strings.TrimPrefix(line, "+CLCC:"), ",")
+		if len(fields) < 3 {
+			continue
+		}
+		state, stateErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if stateErr != nil {
+			continue
+		}
+		switch state {
+		case 0, 2, 3, 4, 5:
+			return true
+		}
+	}
+	return false
+}
 
 // clccActive reports whether the +CLCC lines describe a call in the given
 // direction that has reached state 0 (active). dir < 0 matches either

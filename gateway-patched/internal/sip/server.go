@@ -3,8 +3,10 @@ package sip
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,8 +33,14 @@ type Server struct {
 	// Linphone 锁屏来电推送（linphone_push.go）
 	linphonePushKey string
 	linphonePushURL string
+	linphonePushFrom string
 	pushMu          sync.Mutex
 	pushRegs        map[string]pushParams
+
+	// 已处理的 MESSAGE 事务（Call-ID|CSeq → 时间）。UDP 重传与首次完全同
+	// 头，不去重就会把同一条聊天转发成多条真实短信（2026-09-11 实测：
+	// 一条"你好啊"被 Linphone 重传两次、对面收到两条；打字指示 XML 同样翻倍）。
+	seenMessages sync.Map
 }
 
 func NewServer(listenAddr string, registrar *Registrar, auth *Auth, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio) *Server {
@@ -49,9 +57,48 @@ func (s *Server) AttachEvents(events <-chan modem.ModemEvent, pushToken string) 
 
 // SetLinphonePush 配置 Linphone 锁屏来电推送（FlexiAPI 的 x-api-key）。
 // key 为空 = 功能关闭，行为与旧版完全一致。
-func (s *Server) SetLinphonePush(key, url string) {
+func (s *Server) SetLinphonePush(key, url, from string) {
 	s.linphonePushKey = key
 	s.linphonePushURL = url
+	s.linphonePushFrom = from
+	if key != "" {
+		slog.Info("linphonepush config",
+			"key_prefix", keyPrefix(key), "key_len", len(key), "from", from)
+		go logLinphoneEgressIP()
+	}
+}
+
+// logLinphoneEgressIP 用推送专用的两个 HTTP 客户端各探测一次本机出口 IP。
+// FlexiAPI 的 Key 与「生成时所在机器的出口 IP」强绑定（AuthenticateKey.php
+// 校验 apiKey->ip == request->ip()），生成 Key 的浏览器优先走 IPv6，所以
+// 两条栈的出口都要打出来，一眼就能看出 Key 该绑哪边、当前哪边变了。
+func logLinphoneEgressIP() {
+	// 用 Cloudflare 的 trace 服务（双栈 A+AAAA），返回体含 "ip=" 行，
+	// 能真实反映该栈实际使用的出口地址族；ifconfig.me 之类只有 A 记录，
+	// 会让 v6 栈也退化成 v4，看不出真相。
+	for _, c := range []struct {
+		name   string
+		client *http.Client
+	}{{"v6(default)", linphoneHTTPClient}, {"v4", linphoneHTTPClientV4}} {
+		req, err := http.NewRequest(http.MethodGet, "https://cloudflare.com/cdn-cgi/trace", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			slog.Warn("linphonepush egress probe failed", "stack", c.name, "err", err)
+			continue
+		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		ip := ""
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "ip=") {
+				ip = strings.TrimPrefix(line, "ip=")
+			}
+		}
+		slog.Info("linphonepush egress ip", "stack", c.name, "ip", ip)
+	}
 }
 
 // AttachSMS wires the SMS engine so SIP MESSAGE requests from the phone
@@ -59,6 +106,52 @@ func (s *Server) SetLinphonePush(key, url string) {
 // routes through the NAS Gateway).
 func (s *Server) AttachSMS(send func(ctx context.Context, to, body string) error) {
 	s.sendSMS = send
+}
+
+// ForwardSMS delivers an inbound cellular SMS to every registered SIP client
+// as a SIP MESSAGE (RFC 3428). Linphone renders these as chat messages, so
+// the phone finally sees SIM texts it cannot otherwise receive — the SMS
+// channel is cellular-only and never enters the SIP client on its own.
+func (s *Server) ForwardSMS(peer, body string) {
+	if s.conn == nil || s.registrar == nil || body == "" {
+		return
+	}
+	caller := peer
+	if caller == "" {
+		caller = "unknown"
+	}
+	// SIP 头注入防护：peer 来自蜂窝 PDU，去掉可能破坏 From URI 的字符
+	//（字母数字与 +-. 之外的一律剔除；字母号码类发件人如 "CHINAUNICOM" 也合法）。
+	caller = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '+', r == '-', r == '.':
+			return r
+		}
+		return -1
+	}, caller)
+	if caller == "" {
+		caller = "unknown"
+	}
+	sent := 0
+	for _, reg := range s.registrar.All() {
+		remote := contactAddr(reg.Contact)
+		if remote == nil {
+			continue
+		}
+		local := s.localIPFor(remote)
+		from := fmt.Sprintf("<sip:%s@%s>;tag=sms%d", caller, local, time.Now().UnixNano()%1000000)
+		callID := fmt.Sprintf("sms-%d-%s", time.Now().UnixNano(), reg.Username)
+		msg := fmt.Sprintf("MESSAGE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bKsms%d;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 MESSAGE\r\nContact: <sip:cellbridge@%s:5060>\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s",
+			reg.Username, local, local, time.Now().UnixNano()%100000, from, reg.Username, local, callID, local, len(body), body)
+		if _, err := s.conn.WriteToUDP([]byte(msg), remote); err != nil {
+			slog.Warn("sms forward failed", "user", reg.Username, "peer", peer, "err", err)
+			continue
+		}
+		sent++
+	}
+	if sent > 0 {
+		slog.Info("sms forwarded to clients", "peer", peer, "clients", sent, "length", len(body))
+	}
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -74,7 +167,52 @@ func (s *Server) Start(ctx context.Context) error {
 	slog.Info("sip server listening", "addr", s.listenAddr)
 	go s.readLoop()
 	go s.inboundLoop()
+	go s.ghostReaper()
 	return nil
+}
+
+// ghostReaper clears cellular call contexts leaked by teardown races: a
+// CANCEL/BYE processed while ATD is still dialling can lose the race against
+// the module completing the call, leaving a connected call with no SIP
+// session owning it. Runs only when no session is live, so ATH can never
+// take down a call a client is actually on.
+func (s *Server) ghostReaper() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.maybeReapGhosts()
+	}
+}
+
+// maybeReapGhosts runs one reap pass when no SIP session is live. Safe to
+// call from anywhere; quiet when the modem is busy or unavailable.
+func (s *Server) maybeReapGhosts() {
+	if s.modem == nil {
+		return
+	}
+	busy := false
+	s.sessions.Range(func(_, v any) bool {
+		if sess, ok := v.(*SIPCallSession); ok && sess.State() != "ended" {
+			busy = true
+			return false
+		}
+		return true
+	})
+	if busy {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
+	defer cancel()
+	if _, err := s.modem.ReapGhosts(ctx); err != nil {
+		// Normal when the AT channel is wedged or mid-command; the next
+		// tick retries.
+		slog.Debug("ghost reap skipped", "err", err)
+	}
 }
 
 func (s *Server) Stop(ctx context.Context) error {
@@ -101,6 +239,17 @@ func (s *Server) readLoop() {
 			continue
 		}
 		msg := string(buf[:n])
+		// 信令轨迹：毫秒级时间戳 + 报文首行 + 远端端口。用来诊断
+		// 「客户端秒挂」这类时序问题（RTP 噪声不含 SIP 首行样式，会被过滤）。
+		if first, _, ok := strings.Cut(msg, "\r\n"); ok && (strings.HasPrefix(first, "SIP/2.0") ||
+			strings.HasPrefix(first, "INVITE ") || strings.HasPrefix(first, "ACK ") ||
+			strings.HasPrefix(first, "BYE ") || strings.HasPrefix(first, "CANCEL ") ||
+			strings.HasPrefix(first, "REGISTER ") || strings.HasPrefix(first, "MESSAGE ") ||
+			strings.HasPrefix(first, "OPTIONS ")) {
+			at := time.Now().Format("15:04:05.000")
+			cseq := parseHeader(msg, "CSeq")
+			slog.Info("sip trace in", "at", at, "from", remote.String(), "line", first, "cseq", cseq, "callid", parseHeader(msg, "Call-ID"))
+		}
 		go s.handleMessage(msg, remote)
 	}
 }
@@ -213,37 +362,36 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 		_ = media.Close()
 		return
 	}
-	sent := 0
 	// Linphone 休眠时收不到 UDP INVITE：先推一把把它唤醒（弹 CallKit →
-	// 重新 REGISTER），并把重试窗口从 5s 拉到 20s，等新注册一出现，
-	// 下一轮循环立即把 INVITE 送到新地址。前台客户端不受影响——
-	// 第一轮就送达，后续重试因 sent>0 不再执行。
-	pushSent := s.wakeLinphoneClients(callID)
-	attempts := inboundInviteAttempts
-	if pushSent {
-		attempts = inboundInvitePushAttempts
-	}
+	// 重新 REGISTER）。前台客户端不受影响，第一轮 INVITE 就送到。
+	s.wakeLinphoneClients(callID)
 	// Branch and From-tag of this INVITE. They are derived from the call id
-	// so that a CANCEL sent later (the far end gave up before the phone was
+	// so that the CANCEL sent later (the far end gave up before the phone was
 	// picked up) reuses the very branch the client is showing.
 	shortID := strings.TrimPrefix(callID, "in-")
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
 	}
+	branch := "z9hG4bK" + shortID
 	// Address the phone can actually reach back on. nasIP() only knows the
 	// tailnet (100.x) address and degrades to 127.0.0.1 without Tailscale, so
 	// the VoIP push used to advertise sip:<peer>@127.0.0.1 — YakPhone then woke
 	// for a CallKit call whose URI pointed at the phone itself. Prefer the
 	// interface used to reach the registered client.
 	reachable := ""
-	for attempt := 0; attempt < attempts && sent == 0; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-sess.ctx.Done():
-				return
-			case <-time.After(inboundInviteRetryDelay):
-			}
-		}
+	// inviteRegistered invites every registration of this account that has not
+	// been invited yet, and reports how many invitations went out this pass.
+	//
+	// A later pass is a RETRANSMISSION, not a new call: the branch, Call-ID and
+	// CSeq of the first INVITE are kept, only the destination changes. That
+	// distinction is what makes this safe. A client whose stack is still alive
+	// recognises the branch as its own transaction and merely resends its
+	// provisional response — no second call appears on screen. A client whose
+	// stack the VoIP push restarted has no record of the branch and accepts a
+	// brand-new invitation, which is exactly what puts a transaction on the new
+	// port that the teardown CANCEL can match.
+	inviteRegistered := func() int {
+		sent := 0
 		for _, reg := range s.registrar.All() {
 			remote := contactAddr(reg.Contact)
 			if remote == nil {
@@ -257,35 +405,51 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 				reachable = local
 			}
 			inviteSDP := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", local, local, media.LocalAddr().Port)
-			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bK%s;rport\r\nFrom: <sip:%s@%s>;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, shortID, peer, local, shortID, reg.Username, local, callID, local, len(inviteSDP), inviteSDP)
-			if _, err := s.conn.WriteToUDP([]byte(invite), remote); err != nil {
-				slog.Warn("sip inbound invite failed", "user", reg.Username, "err", err)
+			callerHdrs, callerFrom := inboundCallerHeaders(peer, local)
+			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nFrom: %s;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\n%sContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, branch, callerFrom, shortID, reg.Username, local, callID, local, callerHdrs, len(inviteSDP), inviteSDP)
+			// Claim the address before sending it: a duplicate INVITE to the
+			// same contact rings the phone again instead of fixing anything.
+			if !sess.RememberInvite(inviteAttempt{addr: remote, req: invite}) {
 				continue
 			}
-			sent++
-			// Remember where this invitation went. The far end can give up
-			// while the phone is still ringing, and the only way to stop that
-			// phone ringing is to CANCEL the INVITE — which needs the address
-			// and the exact headers of the invitation it is showing. A later
-			// pickup overwrites this with the established dialog (see
+			// Remember where this invitation went, and the exact bytes of it.
+			// The far end can give up while the phone is still ringing, and the
+			// only way to stop that phone ringing is to CANCEL the invitation
+			// it is showing — which must repeat this message byte for byte.
+			// A later pickup overwrites this with the established dialog (see
 			// acceptInbound). With several registered clients the last one
 			// invited wins; V1 runs a single phone.
 			sess.SetByePlan(byePlan{
 				remote:       remote,
 				reqURI:       contactURI(reg.Contact, remote, reg.Username),
-				from:         fmt.Sprintf("<sip:%s@%s>;tag=cb%s", peer, local, shortID),
+				from:         fmt.Sprintf("%s;tag=cb%s", callerFrom, shortID),
 				to:           fmt.Sprintf("<sip:%s@%s>", reg.Username, local),
 				callID:       callID,
 				inviteCSeq:   1,
-				inviteBranch: "z9hG4bK" + shortID,
+				inviteBranch: branch,
 				inviteReq:    invite,
+				username:     reg.Username,
 			})
-			slog.Info("sip inbound invite sent", "user", reg.Username, "contact", remote.String(), "call", callID, "peer", peer, "attempt", attempt+1)
+			if _, err := s.conn.WriteToUDP([]byte(invite), remote); err != nil {
+				slog.Warn("sip inbound invite failed", "user", reg.Username, "err", err)
+				continue
+			}
+			sent++
+			slog.Info("sip inbound invite sent", "user", reg.Username, "contact", remote.String(), "call", callID, "peer", peer, "attempt", len(sess.InviteAttempts()))
 		}
+		return sent
 	}
+	sent := inviteRegistered()
 	if sent == 0 {
-		slog.Warn("sip inbound invite unsent", "call", callID, "peer", peer, "reason", "no registered client reachable")
+		slog.Warn("sip inbound invite unsent", "call", callID, "peer", peer, "reason", "no registered client reachable yet; sweeping the registrar")
 	}
+	// Keep watching the registration table until the call is answered or gone.
+	// The VoIP push makes Linphone restart its SIP transport, and it comes back
+	// from an entirely new source port (54865 → 61077 → 58100 within 40s on
+	// 2026-09-11). The invitation sent to the previous port is unreachable by
+	// then, so the CANCEL aimed at it matched nothing and the phone rang on
+	// after the caller had hung up.
+	go s.inviteReregisteredContacts(sess, inviteRegistered)
 	if reachable == "" {
 		reachable = s.outboundIP()
 	}
@@ -314,21 +478,43 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 // gateway gives up and hangs up the cellular leg.
 const inboundRingTimeout = 45 * time.Second
 
-// YakPhone re-registers extremely aggressively — an expires=0 unregister
-// immediately followed by a fresh register, several times a minute — so the
-// registrar can be momentarily empty at the exact instant a call arrives.
-// A single delivery attempt then finds no target and the call is dropped on
-// the floor. Retry briefly before giving up; the retry only runs while
-// nothing has been delivered, so a client can never receive two INVITEs for
-// the same call.
-const (
-	inboundInviteAttempts   = 10
-	inboundInviteRetryDelay = 500 * time.Millisecond
+// inboundInviteSweep is how often the registrar is re-read while an inbound
+// call rings, looking for a contact that appeared after the first invitation.
+//
+// A push-woken Linphone re-registers within a second or two of the push, and
+// the invitation already on the wire was addressed to the port it has just
+// abandoned, so this sweep is what actually puts a ringing call in front of
+// the phone. It deliberately does not re-invite an address that was already
+// invited — only a moved contact is re-aimed at.
+const inboundInviteSweep = 600 * time.Millisecond
 
-	// 发过 Linphone 推送后的重试预算：App 冷启动 + 重新 REGISTER 通常
-	// 1~5s，留 20s 覆盖弱网/旧机型（与 45s 振铃超时留有余量）。
-	inboundInvitePushAttempts = 40
-)
+// inviteReregisteredContacts keeps inviting contacts that turn up while the
+// call is still ringing, until the client answers or the call is torn down.
+//
+// The invitation is retransmitted verbatim, branch and all: a client whose
+// stack survived recognises its own transaction and just resends its
+// provisional response, while a client whose stack the push restarted accepts
+// it as the invitation it is now waiting for. Either way the phone ends up
+// with a transaction the teardown CANCEL can name.
+func (s *Server) inviteReregisteredContacts(sess *SIPCallSession, invite func() int) {
+	if invite == nil {
+		return
+	}
+	deadline := time.Now().Add(inboundRingTimeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-sess.ctx.Done():
+			return
+		case <-time.After(inboundInviteSweep):
+		}
+		// Once the client picked up there is a dialog, not an invitation; a
+		// retransmission would only confuse it.
+		if sess.State() != "init" {
+			return
+		}
+		invite()
+	}
+}
 
 // contactAddr extracts host:port from a SIP Contact header value.
 func contactAddr(contact string) *net.UDPAddr {
@@ -430,6 +616,15 @@ func (s *Server) handleResponse(msg string, remote *net.UDPAddr) {
 	if callID == "" {
 		return
 	}
+	if strings.Contains(strings.ToUpper(cseq), "CANCEL") {
+		// The client's verdict on our own CANCEL: 200 means it matched the
+		// transaction and stopped ringing, 481 means there was nothing left to
+		// match — a stack restarted by the VoIP push — and the phone rang on.
+		// Logged before the session lookup because the session is usually gone
+		// by then, and this line is the only visible evidence either way.
+		slog.Info("sip cancel response", "call", callID, "code", code, "remote", remote.String())
+		return
+	}
 	v, ok := s.sessions.Load(callID)
 	if !ok {
 		return
@@ -447,7 +642,7 @@ func (s *Server) handleResponse(msg string, remote *net.UDPAddr) {
 		// means the app never presented it, which points at the app/OS side
 		// (background suspension → needs the PushKit push) rather than at
 		// the gateway.
-		slog.Info("sip inbound provisional", "call", callID, "code", code)
+		slog.Info("sip inbound provisional", "call", callID, "code", code, "remote", remote.String())
 		return
 	case code == 200 && strings.Contains(strings.ToUpper(cseq), "INVITE"):
 		go s.acceptInbound(sess, msg, remote)
@@ -554,6 +749,14 @@ func parseHeader(msg, name string) string {
 // baresip-based and sends SMS as SIP instant messages) over the cellular
 // modem via the attached SMS sender (§30). Responds 200 on acceptance,
 // 500 when no SMS engine is wired or the modem rejects the submission.
+//
+// 三个防护（2026-09-11，起因是"对面收到乱码且重复两次"）：
+//  1. 重传去重：Linphone 对 UDP MESSAGE 在 0.5s/1s/2s 处重发（网关要等
+//     短信提交完才应答，必然超时），相同 Call-ID+CSeq 只提交一次短信；
+//  2. 打字指示过滤：RFC 3994 <isComposing> XML 是客户端打字时自动发的
+//     状态通知，转发成短信就是对面上百字符的乱码长文；
+//  3. 先应答后提交：200 OK 立即回，短信提交放后台——客户端收不到及时
+//     应答才会重传，从源头消灭重传。
 func (s *Server) handleMessageRequest(msg string, remote *net.UDPAddr) {
 	if s.sendSMS == nil {
 		slog.Warn("sip message rejected", "reason", "SMS engine not attached")
@@ -582,15 +785,43 @@ func (s *Server) handleMessageRequest(msg string, remote *net.UDPAddr) {
 		s.sendResponse(remote, msg, 400, "Bad Request", "", "")
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
-	defer cancel()
-	if err := s.sendSMS(ctx, destination, body); err != nil {
-		slog.Warn("sip message send failed", "to", destination, "err", err)
-		s.sendResponse(remote, msg, 500, "Server Error", "", "")
+	// 打字状态指示（RFC 3994）不是聊天内容，直接丢弃。
+	if strings.Contains(body, "<isComposing") {
+		slog.Info("sip message typing indicator dropped", "to", destination, "length", len(body))
+		s.sendResponse(remote, msg, 200, "OK", "", "")
 		return
 	}
-	slog.Info("sip message sent", "to", destination, "length", len(body))
+	// UDP 重传去重：同 Call-ID+CSeq 只提交一次。
+	callID := parseHeader(msg, "Call-ID")
+	cseq := parseHeader(msg, "CSeq")
+	if callID != "" {
+		key := callID + "|" + cseq
+		if _, dup := s.seenMessages.LoadOrStore(key, time.Now()); dup {
+			slog.Info("sip message retransmission dropped", "to", destination, "call", callID, "cseq", cseq)
+			s.sendResponse(remote, msg, 200, "OK", "", "")
+			return
+		}
+		// 顺手清理 2 分钟前的旧事务，防止 map 无限增长。
+		cutoff := time.Now().Add(-2 * time.Minute)
+		s.seenMessages.Range(func(k, v any) bool {
+			if ts, ok := v.(time.Time); ok && ts.Before(cutoff) {
+				s.seenMessages.Delete(k)
+			}
+			return true
+		})
+	}
+	// 先回 200 再提交：让客户端立刻收到应答，不再触发 UDP 重传。
+	// 提交失败只能记日志（对端已收到 200，无法再报错）。
 	s.sendResponse(remote, msg, 200, "OK", "", "")
+	go func() {
+		ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+		defer cancel()
+		if err := s.sendSMS(ctx, destination, body); err != nil {
+			slog.Warn("sip message send failed", "to", destination, "err", err)
+			return
+		}
+		slog.Info("sip message sent", "to", destination, "length", len(body))
+	}()
 }
 
 func (s *Server) handleRegister(msg string, remote *net.UDPAddr) {
@@ -672,6 +903,12 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 	if peer == "" {
 		peer = "unknown"
 	}
+	// 记录客户端 SDP offer 摘要：m= 行 + 加密/ICE 相关属性行。呼出秒断时
+	// 由此判断是否媒体加密强制（offer 带 a=crypto/SAVP 而应答是纯 AVP，
+	// Linphone 会 ACK 后立刻 BYE）或编解码不交集。
+	if body := sdpOfferSummary(msg); body != "" {
+		slog.Info("sip invite offer", "peer", peer, "content_type", parseHeader(msg, "Content-Type"), "sdp", body)
+	}
 	username := extractSIPUser(from)
 	if _, ok := s.registrar.Get(username); !ok {
 		s.sendResponse(remote, msg, 403, "Forbidden", "", "")
@@ -730,6 +967,7 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 		callID:     callID,
 		inviteCSeq: cseqNumber(parseHeader(msg, "CSeq")),
 		inviteReq:  msg,
+		username:   username,
 	})
 	// Claim the Call-ID BEFORE Dial(). Dial() rotates the QDC507 voice route
 	// and issues ATD, which takes 2-9s; the retransmission guard at the top
@@ -810,6 +1048,17 @@ func (s *Server) handleAckBye(msg string, remote *net.UDPAddr, first string) {
 				"reason", parseHeader(msg, "Reason"))
 			_ = sess.Hangup()
 			s.sessions.Delete(callID)
+			// 快速一次性收割：CANCEL/BYE 与蜂窝拨号竞态时，模块可能随后
+			// 才完成应答，留下一具没人认领的"活尸"。3 秒后清一次，不等
+			// 10 秒周期。
+			go func() {
+				select {
+				case <-s.ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+				}
+				s.maybeReapGhosts()
+			}()
 		}
 	}
 	s.sendResponse(remote, msg, 200, "OK", "", "")
@@ -895,7 +1144,9 @@ func (s *Server) sendResponseWithTag(remote *net.UDPAddr, req string, code int, 
 	resp := buildResponse(req, code, reason, extraHeaders, body, tag)
 	if _, err := s.conn.WriteToUDP([]byte(resp), remote); err != nil {
 		slog.Warn("sip response failed", "code", code, "err", err)
+		return
 	}
+	slog.Info("sip trace out", "at", time.Now().Format("15:04:05.000"), "to", remote.String(), "line", fmt.Sprintf("SIP/2.0 %d %s", code, reason), "cseq", parseHeader(req, "CSeq"), "callid", parseHeader(req, "Call-ID"))
 }
 
 // buildResponse renders a SIP response to req. An empty tag mints a fresh
@@ -915,24 +1166,178 @@ func buildResponse(req string, code int, reason, extraHeaders, body, tag string)
 	return fmt.Sprintf("SIP/2.0 %d %s\r\nVia: %s\r\nFrom: %s\r\nTo: %s%s\r\nCall-ID: %s\r\nCSeq: %s\r\n%sContent-Length: %d\r\n\r\n%s", code, reason, via, from, to, tag, callID, cseq, extraHeaders, len(body), body)
 }
 
+// teardownRepeatDelay spaces the duplicate teardown sent to each target.
+// UDP has no retransmission of its own, and the phone this is aimed at is
+// typically mid-reconnect (woken by a VoIP push seconds earlier), so a single
+// lost datagram means the phone keeps ringing for a call nobody is on.
+const teardownRepeatDelay = 200 * time.Millisecond
+
 // sendDialogTeardown tells the SIP client that a call the modem has already
 // released is over. Nothing else in this gateway ever sends a BYE, so a
 // far-end hangup used to leave the client's dialog open forever: the phone
 // stayed "in call" although the audio had stopped.
+//
+// The teardown is sent to every address the dialog's account could currently
+// be reached at, not just the one the INVITE went to. A phone woken by a VoIP
+// push restarts its SIP stack and re-registers from a new source port, which
+// retires the invite-time address; a CANCEL aimed only there was silently
+// dropped and the phone rang on after the far end hung up (observed
+// 2026-09-11: 62862 -> 58591 -> 52543 within seconds).
 func (s *Server) sendDialogTeardown(sess *SIPCallSession, reason string) {
 	plan, ok := sess.ByePlan()
-	if !ok {
+	if !ok || plan.remote == nil {
 		return
 	}
-	method, message := teardownMessage(sess.Direction, sess.State(), sess.LocalTag(), plan, s.localIPFor(plan.remote))
-	if message == "" {
+	// A phone that is still ringing for a call the far end abandoned needs a
+	// CANCEL per invitation, not a BYE: no dialog exists yet.
+	if sess.Direction == "inbound" && sess.State() == "init" {
+		s.cancelInvitations(sess, plan, reason)
 		return
 	}
-	if _, err := s.conn.WriteToUDP([]byte(message), plan.remote); err != nil {
-		slog.Warn("sip teardown failed", "call", sess.ID, "method", method, "err", err)
-		return
+	localIP := s.localIPFor(plan.remote)
+
+	type teardownTarget struct {
+		addr   *net.UDPAddr
+		origin string
 	}
-	slog.Info("sip teardown sent", "call", sess.ID, "method", method, "reason", reason, "remote", plan.remote.String())
+	var targets []teardownTarget
+	seen := make(map[string]bool)
+	add := func(addr *net.UDPAddr, origin string) {
+		if addr == nil || seen[addr.String()] {
+			return
+		}
+		seen[addr.String()] = true
+		targets = append(targets, teardownTarget{addr: addr, origin: origin})
+	}
+	add(plan.remote, "invite")
+	if s.registrar != nil {
+		for _, reg := range s.registrar.All() {
+			if plan.username != "" && reg.Username != plan.username {
+				continue
+			}
+			add(contactAddr(reg.Contact), "reregister")
+		}
+	}
+
+	for _, tg := range targets {
+		// 只有发送地址换成新注册的那个；Request-URI 保持 INVITE 的原值，
+		// 因为 RFC 3261 §9.1 要求 CANCEL 的 Request-URI 与 INVITE 完全相同，
+		// 客户端靠它加上 Call-ID/CSeq/branch 认出该 CANCEL 属于哪个事务。
+		p := plan
+		p.remote = tg.addr
+		method, message := teardownMessage(sess.Direction, sess.State(), sess.LocalTag(), p, localIP)
+		if message == "" {
+			continue
+		}
+		for attempt := 1; attempt <= 2; attempt++ {
+			if _, err := s.conn.WriteToUDP([]byte(message), tg.addr); err != nil {
+				slog.Warn("sip teardown failed", "call", sess.ID, "method", method, "target", tg.origin, "err", err)
+				break
+			}
+			slog.Info("sip teardown sent", "call", sess.ID, "method", method, "reason", reason, "remote", tg.addr.String(), "target", tg.origin, "attempt", attempt)
+			if attempt == 1 {
+				time.Sleep(teardownRepeatDelay)
+			}
+		}
+	}
+}
+
+// cancelInvitations silences a phone that is still ringing for a cellular call
+// the far end has given up on.
+//
+// Every invitation this gateway sent gets its own CANCEL aimed at the contact
+// that received it, because a phone woken by the VoIP push restarts its SIP
+// stack and re-registers from a new port: the invitation it is actually
+// showing is then on a different address than the first one, and a CANCEL only
+// matches the transaction it names. Sending one CANCEL to "the current
+// registration" (as this used to) missed it either way.
+func (s *Server) cancelInvitations(sess *SIPCallSession, plan byePlan, reason string) {
+	attempts := sess.InviteAttempts()
+	if len(attempts) == 0 {
+		// No invitation was recorded (an older session, or one rebuilt by a
+		// test): fall back to the dialog fields.
+		attempts = []inviteAttempt{{addr: plan.remote, req: plan.inviteReq}}
+	}
+	for _, a := range attempts {
+		if a.addr == nil {
+			continue
+		}
+		message := cancelMessage(a.req, s.localIPFor(a.addr))
+		if message == "" {
+			// The raw INVITE is the only reliable source for the Request-URI
+			// and the Via branch. Without it, rebuild from the stored fields so
+			// the call is still cancelled rather than silently left ringing.
+			fallback := plan
+			fallback.remote = a.addr
+			_, message = teardownMessage("inbound", "init", sess.LocalTag(), fallback, s.localIPFor(a.addr))
+		}
+		if message == "" {
+			continue
+		}
+		for attempt := 1; attempt <= 2; attempt++ {
+			if _, err := s.conn.WriteToUDP([]byte(message), a.addr); err != nil {
+				slog.Warn("sip teardown failed", "call", sess.ID, "method", "CANCEL", "remote", a.addr.String(), "err", err)
+				break
+			}
+			slog.Info("sip teardown sent", "call", sess.ID, "method", "CANCEL", "reason", reason, "remote", a.addr.String(), "target", "invite", "attempt", attempt)
+			if attempt == 1 {
+				time.Sleep(teardownRepeatDelay)
+			}
+		}
+	}
+}
+
+// cancelMessage builds the CANCEL for an INVITE this gateway sent, copying
+// every header the CANCEL must repeat out of that very message.
+//
+// RFC 3261 §9.1 requires a CANCEL's Request-URI, Call-ID, From, To and CSeq
+// number to be identical to those of the INVITE, and its top Via to be the
+// INVITE's. Rebuilding them from separate bookkeeping is exactly how this
+// broke: the CANCEL's Request-URI was computed from the client's Contact while
+// the INVITE had been addressed to sip:<user>@<gateway>, so the two disagreed —
+// and a phone unable to match the CANCEL to the invitation it was showing kept
+// ringing after the caller had hung up (observed 2026-09-11). Deriving the
+// CANCEL from the sent bytes makes that drift impossible.
+func cancelMessage(inviteReq, localIP string) string {
+	if inviteReq == "" || localIP == "" {
+		return ""
+	}
+	reqURI := requestURIOf(inviteReq)
+	branch := viaBranchOf(inviteReq)
+	from := parseHeader(inviteReq, "From")
+	to := parseHeader(inviteReq, "To")
+	callID := parseHeader(inviteReq, "Call-ID")
+	cseq := parseHeader(inviteReq, "CSeq")
+	if reqURI == "" || branch == "" || from == "" || to == "" || callID == "" || cseq == "" {
+		return ""
+	}
+	return fmt.Sprintf("CANCEL %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %d CANCEL\r\nContent-Length: 0\r\n\r\n",
+		reqURI, localIP, branch, from, to, callID, cseqNumber(cseq))
+}
+
+// requestURIOf returns the Request-URI of a SIP request message.
+func requestURIOf(msg string) string {
+	line, _, _ := strings.Cut(msg, "\r\n")
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return ""
+	}
+	return fields[1]
+}
+
+// viaBranchOf returns the branch parameter of the topmost Via header — the
+// value that ties a CANCEL to the INVITE transaction it cancels.
+func viaBranchOf(msg string) string {
+	via := parseHeader(msg, "Via")
+	i := strings.Index(via, "branch=")
+	if i < 0 {
+		return ""
+	}
+	rest := via[i+len("branch="):]
+	if j := strings.IndexAny(rest, ";, \t"); j >= 0 {
+		rest = rest[:j]
+	}
+	return strings.TrimSpace(rest)
 }
 
 // teardownMessage builds the SIP message that ends a call at the client, or
@@ -952,9 +1357,14 @@ func teardownMessage(direction, state, localTag string, plan byePlan, localIP st
 	}
 	switch {
 	case direction == "inbound" && state == "init":
-		// No dialog exists yet. CANCEL must reuse the INVITE's Via branch
-		// and CSeq number, otherwise the client cannot match it to the
-		// invitation it is showing.
+		// No dialog exists yet. The CANCEL has to look like the INVITE the
+		// phone is showing, so derive it from that very message whenever we
+		// still have it.
+		if msg := cancelMessage(plan.inviteReq, localIP); msg != "" {
+			return "CANCEL", msg
+		}
+		// Fallback for a plan captured without the raw INVITE (tests, and any
+		// caller that only kept the header fields): rebuild from those.
 		msg := fmt.Sprintf("CANCEL %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %d CANCEL\r\nContent-Length: 0\r\n\r\n",
 			plan.reqURI, localIP, plan.inviteBranch, plan.from, plan.to, plan.callID, plan.inviteCSeq)
 		return "CANCEL", msg
@@ -991,6 +1401,27 @@ func contactURI(contact string, remote *net.UDPAddr, user string) string {
 	return fmt.Sprintf("sip:%s@%s", user, remote.String())
 }
 
+// inboundCallerHeaders renders the caller identity for the INVITE that rings
+// a SIP client for a cellular call.
+//
+// iOS builds the lock-screen caller from the From display name (and from
+// P-Asserted-Identity when it is trusted); a bare "From: <sip:number@host>"
+// left Linphone showing no number at all for an otherwise perfectly delivered
+// incoming call (2026-09-11). The number therefore goes out in every place a
+// client may look: the display name, P-Asserted-Identity and Remote-Party-ID.
+// A call with no caller id gets a neutral "unknown" URI rather than an empty
+// header, which some clients reject outright.
+func inboundCallerHeaders(peer, localIP string) (extra, from string) {
+	if peer == "" {
+		return "", fmt.Sprintf("<sip:unknown@%s>", localIP)
+	}
+	name := `"` + peer + `"`
+	uri := fmt.Sprintf("<sip:%s@%s>", peer, localIP)
+	extra = "P-Asserted-Identity: " + name + " " + uri + "\r\n" +
+		"Remote-Party-ID: " + name + " " + uri + ";party=calling;screen=yes\r\n"
+	return extra, name + " " + uri
+}
+
 // cseqNumber reads the sequence number out of a "CSeq: <n> <METHOD>" header.
 func cseqNumber(cseq string) int {
 	fields := strings.Fields(cseq)
@@ -1025,6 +1456,29 @@ func extractSDP(msg string) string {
 		return ""
 	}
 	return parts[1]
+}
+
+// sdpOfferSummary 提取 SDP 中与"客户端为什么秒挂"相关的行：m= 媒体行
+// （协议是 RTP/AVP 还是 SAVP/SAVPF）、rtpmap、加密与 ICE 属性。用于呼出
+// 接通瞬间被客户端 ACK+BYE 的诊断（2026-09-11）。
+func sdpOfferSummary(msg string) string {
+	sdp := extractSDP(msg)
+	if sdp == "" {
+		return ""
+	}
+	var keep []string
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "m=") || strings.HasPrefix(line, "a=rtpmap") ||
+			strings.HasPrefix(line, "a=crypto") || strings.Contains(line, "SAVP") ||
+			strings.HasPrefix(line, "a=setup") || strings.HasPrefix(line, "a=fingerprint") {
+			keep = append(keep, line)
+		}
+	}
+	return strings.Join(keep, " | ")
 }
 func parseSDPRTP(sdp string) (string, int) {
 	var ip string

@@ -1,9 +1,12 @@
 package sip
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cellbridge/cellbridge/gateway/internal/modem"
 )
@@ -18,10 +21,10 @@ import (
 // was never even found. The phone stayed on the call screen after the audio
 // had already stopped.
 
-const clientInvite = "INVITE sip:10010@100.115.140.25 SIP/2.0\r\n" +
+const clientInvite = "INVITE sip:10010@100.64.0.1 SIP/2.0\r\n" +
 	"Via: SIP/2.0/UDP 100.86.10.78:51122;branch=z9hG4bK09fd;rport\r\n" +
 	"From: <sip:iphone@100.86.10.78>;tag=cliTag99\r\n" +
-	"To: <sip:10010@100.115.140.25>\r\n" +
+	"To: <sip:10010@100.64.0.1>\r\n" +
 	"Call-ID: 8f1a0b2c3d4e5f60\r\n" +
 	"CSeq: 1 INVITE\r\n" +
 	"Contact: <sip:iphone@100.86.10.78:51122>\r\n" +
@@ -33,7 +36,7 @@ func outboundPlan() byePlan {
 	return byePlan{
 		remote:     &net.UDPAddr{IP: net.ParseIP("100.86.10.78"), Port: 51122},
 		reqURI:     "sip:iphone@100.86.10.78:51122",
-		from:       "<sip:10010@100.115.140.25>;tag=cbTag123",
+		from:       "<sip:10010@100.64.0.1>;tag=cbTag123",
 		to:         "<sip:iphone@100.86.10.78>;tag=cliTag99",
 		callID:     "8f1a0b2c3d4e5f60",
 		inviteCSeq: 1,
@@ -45,17 +48,17 @@ func outboundPlan() byePlan {
 // reproduces the dialog it established: same Call-ID, our From tag, the
 // client's To tag, and a CSeq above anything the client sent.
 func TestTeardownConnectedCallSendsBye(t *testing.T) {
-	method, msg := teardownMessage("outbound", "active", "cbTag123", outboundPlan(), "100.115.140.25")
+	method, msg := teardownMessage("outbound", "active", "cbTag123", outboundPlan(), "100.64.0.1")
 	if method != "BYE" {
 		t.Fatalf("a connected call must be ended with BYE, got %q", method)
 	}
 	for _, want := range []string{
 		"BYE sip:iphone@100.86.10.78:51122 SIP/2.0",
-		"From: <sip:10010@100.115.140.25>;tag=cbTag123",
+		"From: <sip:10010@100.64.0.1>;tag=cbTag123",
 		"To: <sip:iphone@100.86.10.78>;tag=cliTag99",
 		"Call-ID: 8f1a0b2c3d4e5f60",
 		"CSeq: 2 BYE",
-		"Via: SIP/2.0/UDP 100.115.140.25:5060",
+		"Via: SIP/2.0/UDP 100.64.0.1:5060",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("BYE missing %q\n--- got ---\n%s", want, msg)
@@ -70,13 +73,13 @@ func TestTeardownRingingInboundSendsCancel(t *testing.T) {
 	plan := byePlan{
 		remote:       &net.UDPAddr{IP: net.ParseIP("100.86.10.78"), Port: 54434},
 		reqURI:       "sip:iphone@100.86.10.78:54434",
-		from:         "<sip:15688525123@100.115.140.25>;tag=cb499fba6f",
-		to:           "<sip:iphone@100.115.140.25>",
+		from:         "<sip:13800138000@100.64.0.1>;tag=cb499fba6f",
+		to:           "<sip:iphone@100.64.0.1>",
 		callID:       "in-499fba6f-80cd-4269-b63b-2f4575dbc97a",
 		inviteCSeq:   1,
 		inviteBranch: "z9hG4bK499fba6f",
 	}
-	method, msg := teardownMessage("inbound", "init", "", plan, "100.115.140.25")
+	method, msg := teardownMessage("inbound", "init", "", plan, "100.64.0.1")
 	if method != "CANCEL" {
 		t.Fatalf("a still-ringing inbound call must be cancelled, got %q", method)
 	}
@@ -96,7 +99,7 @@ func TestTeardownRingingInboundSendsCancel(t *testing.T) {
 // error, or the client keeps ringing until its own transaction timer expires
 // (64s) for a call that is already dead.
 func TestTeardownUnansweredOutboundSendsError(t *testing.T) {
-	method, msg := teardownMessage("outbound", "dialing", "cbTag123", outboundPlan(), "100.115.140.25")
+	method, msg := teardownMessage("outbound", "dialing", "cbTag123", outboundPlan(), "100.64.0.1")
 	if method != "480" {
 		t.Fatalf("an unanswered outbound call must be answered with 480, got %q", method)
 	}
@@ -108,7 +111,7 @@ func TestTeardownUnansweredOutboundSendsError(t *testing.T) {
 	for _, want := range []string{
 		"branch=z9hG4bK09fd",
 		"CSeq: 1 INVITE",
-		"To: <sip:10010@100.115.140.25>;tag=cbTag123",
+		"To: <sip:10010@100.64.0.1>;tag=cbTag123",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("480 missing %q\n--- got ---\n%s", want, msg)
@@ -223,5 +226,221 @@ func TestCSeqNumber(t *testing.T) {
 	}
 	if got := cseqNumber(""); got != 0 {
 		t.Fatalf("empty CSeq must read as 0, got %d", got)
+	}
+}
+
+// 2026-09-11: an incoming call rang on after the far end hung up. The CANCEL
+// had been assembled from separate bookkeeping — its Request-URI came from the
+// client's Contact — while the INVITE had been addressed to
+// sip:<user>@<gateway>. RFC 3261 §9.1 requires the two to match, so the phone
+// could not tie the CANCEL to the invitation on its screen and kept ringing.
+func TestCancelMessageMirrorsTheInvite(t *testing.T) {
+	invite := "INVITE sip:iphone@192.168.31.109 SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 192.168.31.109:5060;branch=z9hG4bK9c1f0d2a;rport\r\n" +
+		"From: \"13800138000\" <sip:13800138000@192.168.31.109>;tag=cb9c1f0d2a\r\n" +
+		"To: <sip:iphone@192.168.31.109>\r\n" +
+		"Call-ID: in-9c1f0d2a\r\n" +
+		"CSeq: 1 INVITE\r\n" +
+		"Contact: <sip:cellbridge@192.168.31.109:5060>\r\n" +
+		"Content-Length: 0\r\n\r\n"
+
+	msg := cancelMessage(invite, "192.168.31.109")
+	for _, want := range []string{
+		"CANCEL sip:iphone@192.168.31.109 SIP/2.0",
+		"branch=z9hG4bK9c1f0d2a",
+		`From: "13800138000" <sip:13800138000@192.168.31.109>;tag=cb9c1f0d2a`,
+		"To: <sip:iphone@192.168.31.109>",
+		"Call-ID: in-9c1f0d2a",
+		"CSeq: 1 CANCEL",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("CANCEL 缺少 %q\n--- got ---\n%s", want, msg)
+		}
+	}
+}
+
+// A phone woken by the VoIP push restarts its SIP stack and re-registers from a
+// NEW source port, so the invitation it is showing can sit on a different
+// address than the first one. Every invitation this gateway sent must be
+// cancelled where it went — with the message it carried there.
+func TestTeardownCancelsEveryInvitationSent(t *testing.T) {
+	oldConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldConn.Close()
+	newConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newConn.Close()
+	gwConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gwConn.Close()
+
+	inviteAddr := oldConn.LocalAddr().(*net.UDPAddr)
+	reregAddr := newConn.LocalAddr().(*net.UDPAddr)
+
+	invite := "INVITE sip:iphone@127.0.0.1 SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK9c1f0d2a;rport\r\n" +
+		"From: \"13800138000\" <sip:13800138000@127.0.0.1>;tag=cb9c1f0d2a\r\n" +
+		"To: <sip:iphone@127.0.0.1>\r\n" +
+		"Call-ID: in-9c1f0d2a\r\n" +
+		"CSeq: 1 INVITE\r\n" +
+		"Content-Length: 0\r\n\r\n"
+
+	s := &Server{conn: gwConn}
+	sess := newTestSession("in-9c1f0d2a", "inbound", "init")
+	if !sess.RememberInvite(inviteAttempt{addr: inviteAddr, req: invite}) {
+		t.Fatal("首次邀请应被记录")
+	}
+	// The retransmission that follows the phone's re-registration keeps the
+	// branch (it is the same transaction) and only changes destination.
+	if !sess.RememberInvite(inviteAttempt{addr: reregAddr, req: invite}) {
+		t.Fatal("换端口后的重新投递应被记录")
+	}
+	sess.SetByePlan(byePlan{
+		remote:   inviteAddr,
+		reqURI:   "sip:iphone@" + inviteAddr.String(),
+		callID:   "in-9c1f0d2a",
+		username: "iphone",
+		inviteReq: invite,
+	})
+
+	s.sendDialogTeardown(sess, "test")
+
+	buf := make([]byte, 4096)
+	for name, conn := range map[string]*net.UDPConn{"邀请时的地址": oldConn, "重新注册后的地址": newConn} {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("%s 没有收到任何 teardown: %v", name, err)
+			continue
+		}
+		msg := string(buf[:n])
+		// Request-URI 必须原样复用 INVITE 的值，而不是客户端 Contact。
+		if want := "CANCEL sip:iphone@127.0.0.1 SIP/2.0"; !strings.HasPrefix(msg, want) {
+			t.Errorf("%s: Request-URI 必须与 INVITE 相同\n want %q\n got  %q", name, want, strings.SplitN(msg, "\r\n", 2)[0])
+		}
+		if !strings.Contains(msg, "Call-ID: in-9c1f0d2a") {
+			t.Errorf("%s: CANCEL 丢了对话框 Call-ID\n--- got ---\n%s", name, msg)
+		}
+		if !strings.Contains(msg, "CSeq: 1 CANCEL") {
+			t.Errorf("%s: CANCEL 必须复用 INVITE 的 CSeq\n--- got ---\n%s", name, msg)
+		}
+	}
+}
+
+// Inviting the same contact twice rings the phone a second time instead of
+// fixing anything, so only a contact that moved gets a second invitation.
+func TestRememberInviteIgnoresRepeatAddresses(t *testing.T) {
+	sess := newTestSession("in-7a10", "inbound", "init")
+	first := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000}
+	if !sess.RememberInvite(inviteAttempt{addr: first, req: "INVITE sip:iphone@127.0.0.1 SIP/2.0\r\n\r\n"}) {
+		t.Fatal("首次邀请应被记录")
+	}
+	same := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000}
+	if sess.RememberInvite(inviteAttempt{addr: same, req: "INVITE sip:iphone@127.0.0.1 SIP/2.0\r\n\r\n"}) {
+		t.Error("同一地址不得被邀请两次")
+	}
+	if got := len(sess.InviteAttempts()); got != 1 {
+		t.Errorf("记录数 = %d, want 1", got)
+	}
+}
+
+// The sweep is what reaches a phone that came back on a new port after the push
+// woke it: the invitation already on the wire went to the port it abandoned.
+func TestReregisteredContactIsInvitedAgain(t *testing.T) {
+	firstConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstConn.Close()
+	secondConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondConn.Close()
+	gwConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gwConn.Close()
+
+	firstAddr := firstConn.LocalAddr().(*net.UDPAddr)
+	secondAddr := secondConn.LocalAddr().(*net.UDPAddr)
+	reg := NewRegistrar()
+	reg.Register("iphone", fmt.Sprintf("<sip:iphone@%s>;expires=300", firstAddr.String()), "UDP", 300)
+
+	s := &Server{conn: gwConn, registrar: reg, ctx: context.Background()}
+	s.ringClients(modem.ModemEvent{Kind: "incoming", CallID: modem.CallID("rereg-0001"), Peer: "13800138000"})
+
+	buf := make([]byte, 4096)
+	_ = firstConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := firstConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("首次 INVITE 未送达: %v", err)
+	}
+	first := string(buf[:n])
+
+	// The phone restarts its SIP stack and comes back on a new port.
+	reg.Register("iphone", fmt.Sprintf("<sip:iphone@%s>;expires=300", secondAddr.String()), "UDP", 300)
+
+	_ = secondConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err = secondConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("换端口后没有收到重新投递的 INVITE: %v", err)
+	}
+	again := string(buf[:n])
+	if !strings.HasPrefix(again, "INVITE ") {
+		t.Errorf("新地址收到 %q，应为 INVITE", strings.SplitN(again, "\r\n", 2)[0])
+	}
+	// 必须是同一事务的重投（分支不变），否则手机上会出现第二通来电。
+	for _, want := range []string{"Call-ID: in-rereg-0001", "branch=z9hG4bK"} {
+		if !strings.Contains(again, want) {
+			t.Errorf("重新投递的 INVITE 缺少 %q\n--- got ---\n%s", want, again)
+		}
+	}
+	if !strings.Contains(first, viaBranchOf(again)) {
+		t.Errorf("重新投递必须复用首次 INVITE 的 branch\n first: %q\n again: %q", first, again)
+	}
+	// 老地址不得再收到第二发。
+	_ = firstConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, _, err := firstConn.ReadFromUDP(buf); err == nil {
+		t.Error("已被邀请过的地址不应再次收到 INVITE")
+	}
+}
+
+// The caller number has to survive the trip into the INVITE: iOS fills the
+// lock-screen caller from the From display name, and a bare URI showed nothing.
+func TestInboundCallerHeadersCarryTheNumber(t *testing.T) {
+	extra, from := inboundCallerHeaders("13800138000", "192.168.31.109")
+	if !strings.Contains(from, `"13800138000"`) {
+		t.Errorf("From 缺少带引号的号码显示名: %q", from)
+	}
+	if !strings.Contains(from, "<sip:13800138000@192.168.31.109>") {
+		t.Errorf("From 缺少号码 URI: %q", from)
+	}
+	for _, want := range []string{
+		`P-Asserted-Identity: "13800138000" <sip:13800138000@192.168.31.109>`,
+		`Remote-Party-ID: "13800138000" <sip:13800138000@192.168.31.109>`,
+	} {
+		if !strings.Contains(extra, want) {
+			t.Errorf("缺少 %q\n--- got ---\n%s", want, extra)
+		}
+	}
+}
+
+// A call with no caller id must still produce a well-formed From: an empty
+// header is rejected by some clients, which would drop the call entirely.
+func TestInboundCallerHeadersWithoutNumberStayWellFormed(t *testing.T) {
+	extra, from := inboundCallerHeaders("", "192.168.31.109")
+	if extra != "" {
+		t.Errorf("无号码时不应产生身份头，得到 %q", extra)
+	}
+	if !strings.HasPrefix(from, "<sip:unknown@192.168.31.109>") {
+		t.Errorf("无号码时 From 应为 unknown URI，得到 %q", from)
 	}
 }

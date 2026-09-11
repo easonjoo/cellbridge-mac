@@ -58,7 +58,7 @@ HEARTBEAT="$LOGDIR/route-rearm.heartbeat"
 if ! mkdir "$LOCK" 2>/dev/null; then
   OLD=$(cat "$LOCK/pid" 2>/dev/null | tr -dc '0-9')
   if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
-    _say "已有实例在运行（PID=$OLD），本实例退出"
+    _say "已有实例在运行（PID=${OLD}），本实例退出"
     exit 0
   fi
   rm -rf "$LOCK"
@@ -91,24 +91,25 @@ rearm() {
       PENDING=1   # 失败：桥仍是脏的，下一通开始前还会再试
       ;;
   esac
-  _say "重挂（$1）：$OUT"
+  _say "重挂（${1}）：${OUT}"
 }
 
-_say "route-rearm 启动（PID=$$，日志=$GLOG，等待=${DELAY}s，合并窗=${COALESCE}s，轮询=${POLL}s）"
+MYPID=$$
+_say "route-rearm 启动（PID=${MYPID}，日志=${GLOG}，等待=${DELAY}s，合并窗=${COALESCE}s，轮询=${POLL}s）"
 
 # 先记住「当前末尾」（真实冷启动要跑几秒 adb，重挂期间产生的事件不该被丢），
 # 再冷启动挂一次，保证启动后的首通可用；历史事件不回放。
 MARK=$(wc -l < "$GLOG" 2>/dev/null | tr -d ' ')
 [ -n "$MARK" ] || MARK=0
 rearm "冷启动"
-_say "从第 $MARK 行开始跟踪"
+_say "从第 ${MARK} 行开始跟踪"
 
 while :; do
   touch "$HEARTBEAT" 2>/dev/null
   CUR=$(wc -l < "$GLOG" 2>/dev/null | tr -d ' ')
   [ -n "$CUR" ] || CUR=0
   if [ "$CUR" -lt "$MARK" ]; then
-    _say "日志被截断（$MARK → $CUR），重置跟踪位置"
+    _say "日志被截断（${MARK} → ${CUR}），重置跟踪位置"
     MARK="$CUR"
   elif [ "$CUR" -gt "$MARK" ]; then
     OLD=$MARK
@@ -167,14 +168,14 @@ while :; do
       rm -f "$LOGDIR/.route-rearm.ev.$$"
 
       if [ "$NEED_NOW" -eq 1 ]; then
-        _say "批次 行 $OLD→$CUR（$NLINES 行，批内最新事件滞后 $LAG）→ 通话开始前刷新"
+        _say "批次 行 ${OLD}→${CUR}（${NLINES} 行，批内最新事件滞后 ${LAG}）→ 通话开始前刷新"
         rearm "通话开始前刷新"
       elif [ "$NEED_AFTER" -eq 1 ]; then
-        _say "批次 行 $OLD→$CUR（$NLINES 行，批内最新事件滞后 $LAG）"
+        _say "批次 行 ${OLD}→${CUR}（${NLINES} 行，批内最新事件滞后 ${LAG}）"
         sleep "$DELAY"
         rearm "通话结束后"
       else
-        _say "批次 行 $OLD→$CUR（$NLINES 行，批内最新事件滞后 $LAG）→ 无需重挂（距上次重挂 $(( $(date +%s) - LAST_REARM ))s）"
+        _say "批次 行 ${OLD}→${CUR}（${NLINES} 行，批内最新事件滞后 ${LAG}）→ 无需重挂（距上次重挂 $(( $(date +%s) - LAST_REARM ))s）"
       fi
     fi
   fi

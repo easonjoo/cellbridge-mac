@@ -49,8 +49,21 @@ done
 APP_PY="$DIR/at_pty_bridge.py"
 BRIDGE="$DIR/voice-audio-bridge"
 GATEWAY="$DIR/cellbridge-gateway"
+# 凭据从 gitignored 的 cellbridge.secrets.env 读取（不要把口令写进仓库 / 脚本）。
+# 该文件含 SIP_USER/SIP_PASS/SIP_USER2/SIP_PASS2，详见 cellbridge.secrets.env.example。
+SECRETS_FILE="${SECRETS_FILE:-$DIR/cellbridge.secrets.env}"
+if [ -f "$SECRETS_FILE" ]; then
+  set -a; . "$SECRETS_FILE"; set +a
+fi
 SIP_USER="${SIP_USER:-iphone}"
-SIP_PASS="${SIP_PASS:-cellbridge-$(id -un)}"
+SIP_PASS="${SIP_PASS:-}"
+# 第二分机：单账号双通道方案（出门 Tailscale / 在家 Shadowrocket Host 映射到局域网）
+SIP_USER2="${SIP_USER2:-sheldon}"
+SIP_PASS2="${SIP_PASS2:-}"
+if [ -z "$SIP_PASS" ] || [ -z "$SIP_PASS2" ]; then
+  echo "ERROR: SIP_PASS / SIP_PASS2 未设置。请把口令写入 cellbridge.secrets.env（复制 .example 改值）或经环境变量提供；勿用弱口令、勿提交到仓库。" >&2
+  exit 1
+fi
 
 mkdir -p "$RUN" "$DATA" "$LOG"
 
@@ -115,6 +128,43 @@ fi
 # 「重启后第一通正常、之后全哑」，且重启服务也修不好（因为又被杀一遍）。
 "$0" stop >/dev/null 2>&1
 sleep 1
+
+# find_voiceruntime — 在两处可能的位置找声卡 .ko：
+#   ① 仓库根 voice-runtime/（手动放置或旧布局）
+#   ② module-tools/voice-runtime/（voice_runtime.py provision_runtime() 的部署目标）
+find_voiceruntime() {
+  for d in "$DIR/voice-runtime" "$DIR/module-tools/voice-runtime"; do
+    if [ -f "$d/qdc507_aprv3.ko" ] && [ -f "$d/qdc507_voice.ko" ]; then
+      echo "$d"; return 0
+    fi
+  done
+  return 1
+}
+
+# --- 模块声卡驱动自愈 ---
+# 模块（QDC507）重启后内核模块全部清空，声卡 .ko 不会自动加载，表现为
+# /proc/asound/cards 报 "no soundcards"、tinymix 全部写不进、通话蜂窝侧
+# 全零静音。这里检测到声卡缺失时自动推驱动 + insmod（驱动在 voice-runtime/，
+# insmod 顺序必须是先 aprv3 后 voice）。
+if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb" ]; then
+  export PATH="$HOME/Applications/platform-tools:$PATH"
+  if adb shell 'ls /dev/snd/controlC0 >/dev/null 2>&1'; then
+    echo "    模块声卡正常"
+  elif KO_DIR="$(find_voiceruntime)"; then
+    echo "    模块声卡缺失（模块重启过？）→ 自动加载驱动…"
+    adb push "$KO_DIR/qdc507_aprv3.ko" /data/qdc507_aprv3.ko >/dev/null 2>&1
+    adb push "$KO_DIR/qdc507_voice.ko" /data/qdc507_voice.ko >/dev/null 2>&1
+    if adb shell 'insmod /data/qdc507_aprv3.ko && insmod /data/qdc507_voice.ko' 2>/dev/null \
+       && adb shell 'ls /dev/snd/controlC0 >/dev/null 2>&1'; then
+      echo "    声卡驱动已加载（qdc507_aprv3 + qdc507_voice）"
+      sleep 1
+    else
+      echo "    警告：声卡驱动加载失败（通话可能无蜂窝音频，重启模块后重试）"
+    fi
+  else
+    echo "    警告：声卡 .ko 缺失（可跑 module-tools/voice_runtime.py 部署），声卡缺失时无法自愈"
+  fi
+fi
 
 # --- 语音路由（01.001.02.004 固件，会话类型含 CSVoice/VoLTE/VoiceMMode）---
 # 模块重启后 mixer 复位，每次启动时重新写入；mini_tinymix 由 module-tools 交叉编译
@@ -278,9 +328,11 @@ echo "[2/3] 启动音频桥（FIFO 模式，空闲挂起=${CB_AUDIO_IDLE_SUSPEND
 # --- 组件 3：网关 ---
 # 真实短信（不设则默认 dry-run）
 export CELLBRIDGE_SMS_DRY_RUN="${CELLBRIDGE_SMS_DRY_RUN:-false}"
-# 短信收件箱轮询间隔。默认 5s 保持原有及时性；长期值守想进一步降热可设
-# CELLBRIDGE_SMS_POLL_INTERVAL=30s（代价：收到短信最多延迟该时长）。
-export CELLBRIDGE_SMS_POLL_INTERVAL="${CELLBRIDGE_SMS_POLL_INTERVAL:-5s}"
+# 短信收件箱轮询间隔。模块已实测可达 60+°C（thermal 监控可见），而 5s 轮询是
+# 长期的持续微小热源，故默认提到 15s 以降低模块空转热（实测 64°C 时仍有用）；
+# 想要更快短信可下调：export CELLBRIDGE_SMS_POLL_INTERVAL=5s；想更凉可设 30s
+# （代价：收到短信最多延迟该时长）。
+export CELLBRIDGE_SMS_POLL_INTERVAL="${CELLBRIDGE_SMS_POLL_INTERVAL:-15s}"
 
 # --- PushKit token（来电 CallKit 振铃 / 短信通知唤醒的必要条件）---
 # 获取方式：YakPhone → 设置 → 推送/Push 页 → 复制 Push Token（形如 AAA...==）。
@@ -363,6 +415,8 @@ sip:
   users:
     - username: $SIP_USER
       password: $SIP_PASS
+    - username: $SIP_USER2
+      password: $SIP_PASS2
 recording:
   enabled: false
 EOF
@@ -370,6 +424,7 @@ EOF
 # Linphone 锁屏来电推送（FlexiAPI x-api-key，见 set-linphone-push.sh）
 if [ -f "$HOME/.cellbridge/linphone_push_key" ]; then
   export CB_LINPHONE_PUSH_KEY="$(head -1 "$HOME/.cellbridge/linphone_push_key" | tr -d '[:space:]')"
+  [ -f "$HOME/.cellbridge/linphone_push_from" ] && export CB_LINPHONE_FROM="$(head -1 "$HOME/.cellbridge/linphone_push_from" | tr -d '[:space:]')"
   [ -f "$HOME/.cellbridge/linphone_push_url" ] && export CB_LINPHONE_PUSH_URL="$(head -1 "$HOME/.cellbridge/linphone_push_url" | tr -d '[:space:]')"
 fi
 

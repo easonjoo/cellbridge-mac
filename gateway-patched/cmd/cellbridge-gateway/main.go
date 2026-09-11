@@ -244,9 +244,10 @@ func main() {
 		application.SMSEngine = sms.NewEngine(database, serialAdapter)
 		// 短信收件箱靠轮询（本模块未启用 AT+CNMI URC 上报），每轮发
 		// AT+CPMS + AT+CMGL 两条命令唤醒模块基带。长期值守下这是持续的
-		// 微小热源，故做成可调：CELLBRIDGE_SMS_POLL_INTERVAL=30s 可显著
-		// 降频（代价是短信最多延迟该时长）。默认保持 5s，行为不变。
-		smsPollInterval := 5 * time.Second
+		// 微小热源，故做成可调：CELLBRIDGE_SMS_POLL_INTERVAL 可显著降频
+		// （代价是短信最多延迟该时长）。默认 15s（thermal 优化已从 5s 提到
+		// 15s 以降低模块空转热）；需要更快短信可调小该变量。
+		smsPollInterval := 15 * time.Second
 		if raw := strings.TrimSpace(os.Getenv("CELLBRIDGE_SMS_POLL_INTERVAL")); raw != "" {
 			if parsed, parseErr := time.ParseDuration(raw); parseErr == nil && parsed > 0 {
 				smsPollInterval = parsed
@@ -300,6 +301,9 @@ func main() {
 				slog.Warn("modem URC reader stopped", "error", runErr)
 			}
 		}()
+		// 模块温度遥测：每 30s 读一次 AT+QTEMP/AT+CPUTEMP，过热告警（仅观察，
+		// 不擅自降频——降频请用 CELLBRIDGE_SMS_POLL_INTERVAL）。
+		go thermalMonitor(shutdownContext, serialAdapter)
 		if settings.SIP.Enabled {
 			registrar := sip.NewRegistrar()
 			sipAuth := sip.NewAuth(settings.SIP.Realm)
@@ -313,7 +317,7 @@ func main() {
 			// 由 start_cellbridge.sh 从 ~/.cellbridge/linphone_push_key 注入。
 			// 可选 CB_LINPHONE_PUSH_URL 覆盖默认的 subscribe.linphone.org。
 			if lpKey := os.Getenv("CB_LINPHONE_PUSH_KEY"); lpKey != "" {
-				sipServer.SetLinphonePush(lpKey, os.Getenv("CB_LINPHONE_PUSH_URL"))
+				sipServer.SetLinphonePush(lpKey, os.Getenv("CB_LINPHONE_PUSH_URL"), os.Getenv("CB_LINPHONE_FROM"))
 				slog.Info("linphone push enabled", "url", sip.LinphonePushURL(os.Getenv("CB_LINPHONE_PUSH_URL")))
 			}
 			if application.SMSEngine != nil {
@@ -321,6 +325,8 @@ func main() {
 					_, err := application.SMSEngine.Send(ctx, to, body)
 					return err
 				})
+				// 入站 SIM 短信实时转发为 SIP MESSAGE → Linphone 聊天页可见。
+				application.InboundSMSNotifier = sipServer.ForwardSMS
 			}
 			if err := sipServer.Start(shutdownContext); err != nil {
 				slog.Error("start SIP server", "error", err)
@@ -369,6 +375,37 @@ func recordingEventPayload(item db.Recording) map[string]any {
 		value["sizeBytes"] = *item.SizeBytes
 	}
 	return value
+}
+
+// thermalMonitor logs the cellular module's internal temperature every 30s
+// and warns when it runs hot. A 24/7 gateway in a closed enclosure cooks the
+// module; catching it early avoids RF throttling and dropped calls. It only
+// reads AT (no throttling of its own) so it never adds to the heat it watches.
+func thermalMonitor(ctx context.Context, m *at.Adapter) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	read := func() {
+		c, src, err := m.Temperature(ctx)
+		if err != nil {
+			slog.Debug("modem temperature unavailable", "err", err)
+			return
+		}
+		fields := []any{"temp_c", c, "source", src}
+		if c >= 60 {
+			slog.Warn("modem temperature HIGH — 考虑提高 CELLBRIDGE_SMS_POLL_INTERVAL 或改善散热", fields...)
+		} else {
+			slog.Info("modem temperature", fields...)
+		}
+	}
+	read()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			read()
+		}
+	}
 }
 
 func openConfiguredModem(configuredPath string, baud int) (*at.Adapter, error) {

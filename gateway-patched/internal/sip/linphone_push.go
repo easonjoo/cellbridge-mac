@@ -2,9 +2,11 @@ package sip
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,7 +25,15 @@ import (
 //   4. Linphone 被唤醒 → 弹 CallKit → 重新 REGISTER；
 //   5. 网关的重试循环在此期间持续尝试，新注册一出现 INVITE 即送达。
 //
-// 注意：账号面板生成的 API Key 绑定生成时的出口 IP，且闲置会过期。
+// 注意：请求必须同时携带 x-api-key 与 From（Key 所属账号的 SIP 地址），
+// 缺 From 会报 401 Invalid API Key。
+//
+// ⚠ Key 与出口 IP 绑定（AuthenticateKey.php：apiKey->ip == request->ip()，
+// 面板生成 Key 时无条件绑定 $request->ip()，无法关闭）。双栈网络下
+// macOS 的 IPv6 隐私临时地址会轮换，导致同一把 Key 时 200 时 401。
+// 因此这里强制走 IPv4（CGNAT 公网出口远比 v6 临时地址稳定）——
+// 生成 Key 时也必须让浏览器走 IPv4（临时关闭 v6 再生成）。
+//
 // Key 过期的症状：push 返回 401/403 —— 重新在 Mac 上登录
 // subscribe.linphone.org 生成一个即可（见 set-linphone-push.sh）。
 
@@ -99,59 +109,178 @@ func sanitizeCallID(id string) string {
 	return b.String()
 }
 
-var linphoneHTTPClient = &http.Client{
-	// 直连（不经系统代理）：yakpush.go 同款理由，代理会 EOF/502。
-	Timeout:   10 * time.Second,
-	Transport: &http.Transport{Proxy: nil},
+// cleanPushParam 把 pn-param 规整为 FlexiAPI 可接受的形式。
+// FlexiAPI 只允许字母数字、点、下划线；而 Linphone 注册时上报的
+// pn-param 可能带 "&remote" 之类的推送方式后缀（RFC 8599 的 remote
+// push 变体），必须剥掉，否则整个请求被 422 拒绝。
+func cleanPushParam(param string) string {
+	if i := strings.Index(param, "&"); i >= 0 {
+		param = param[:i]
+	}
+	return strings.Trim(param, `"'`)
+}
+
+// pickCallPrid 从 pn-prid 里选出通话（voip）推送 token。
+// Linphone 可能合并上报双 token："<tok>:voip&<tok2>:remote"。
+// "call" 推送必须发给持 voip 证书的 token，且 prid 只允许
+// 字母数字、-、_、:，"&" 会被 422 拒绝。
+func pickCallPrid(prid string) string {
+	tokens := strings.Split(prid, "&")
+	if len(tokens) == 1 {
+		return strings.Trim(prid, `"'`)
+	}
+	for _, t := range tokens {
+		if strings.HasSuffix(t, ":voip") {
+			return t
+		}
+	}
+	return tokens[0]
+}
+
+// linphoneDialer 见下方双栈说明。
+var linphoneDialer = &net.Dialer{Timeout: 8 * time.Second}
+
+// newLinphoneClient 造一个直连（不经系统代理）的推送客户端。
+// Prot：代理会 EOF/502，必须直连。
+// DisableKeepAlives：FlexiAPI 的 LB 节点间数据不一致（实测同一 Key 在部分
+// 节点恒 401），keep-alive 会把后续请求黏在同一条连接（同一节点）上导致
+// 401 成簇；禁用后每次推送/重试都新建连接重新选节点。
+func newLinphoneClient(network string) *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             nil,
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return linphoneDialer.DialContext(ctx, network, addr)
+			},
+		},
+	}
+}
+
+// 双栈客户端：FlexiAPI 的 Key 与「生成 Key 时浏览器的出口 IP」强绑定
+// （AuthenticateKey.php: apiKey->ip == request->ip()），而浏览器默认优先走
+// IPv6 —— 若网关硬走 IPv4 就永远 401。但 IPv6 隐私临时地址会轮换，硬走 v6
+// 也不稳。故两个都备着：先试系统默认（v6 优先，对齐浏览器），401/403 再
+// 退回 v4，哪一栈与 Key 绑定一致就用哪一栈。
+var (
+	linphoneHTTPClient   = newLinphoneClient("tcp")
+	linphoneHTTPClientV4 = newLinphoneClient("tcp4")
+)
+
+// keyPrefix 返回 Key 的前 6 位（仅用于日志比对，避免整串密钥落盘）。
+func keyPrefix(key string) string {
+	if len(key) <= 6 {
+		return key
+	}
+	return key[:6] + "…"
 }
 
 // sendLinphonePush 对一组注册参数发起一次 "call" 推送。
 // 阻塞至 HTTP 返回（≤10s），由调用方决定放不放 goroutine。
+// 401/403 自动重试一次：FlexiAPI 后端偶发地对有效 Key 返回
+// Invalid API Key（多节点/缓存不一致），重试即可通过。
 func (s *Server) sendLinphonePush(pp pushParams, callID string) {
 	key := s.linphonePushKey
-	if key == "" || !pp.valid() {
+	if key == "" || pp.Provider == "" {
 		return
 	}
+	// 诊断：Key 前缀 + From 每次推送都打，排查「Key 是否与面板生成的一致」。
+	accountBased := cleanPushParam(pp.Param) == "" && pickCallPrid(pp.Prid) == ""
+	slog.Info("linphonepush dispatch",
+		"key_prefix", keyPrefix(key), "key_len", len(key),
+		"from", s.linphonePushFrom,
+		"param", cleanPushParam(pp.Param),
+		"account_based", accountBased)
 	url := s.linphonePushURL
 	if url == "" {
 		url = linphonePushURLDefault
 	}
-	payload, err := json.Marshal(map[string]string{
+	// pn_param / pn_prid 留空（nil）即「按账号推送」：FlexiAPI 推给该账号在
+	// sip.linphone.org 上注册的设备，无需手机把 token 报到 cellbridge。手机
+	// 休眠/锁屏时不发送 pn 参数也可被唤醒。
+	pl := map[string]any{
 		"pn_provider": pp.Provider,
-		"pn_param":    pp.Param,
-		"pn_prid":     pp.Prid,
 		"type":        "call",
 		"call_id":     sanitizeCallID(callID),
-	})
+	}
+	if p := cleanPushParam(pp.Param); p != "" {
+		pl["pn_param"] = p
+	} else {
+		pl["pn_param"] = nil
+	}
+	if pr := pickCallPrid(pp.Prid); pr != "" {
+		pl["pn_prid"] = pr
+	} else {
+		pl["pn_prid"] = nil
+	}
+	payload, err := json.Marshal(pl)
 	if err != nil {
 		return
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-api-key", key)
-	resp, err := linphoneHTTPClient.Do(req)
-	if err != nil {
-		slog.Warn("linphonepush failed", "err", err)
-		return
-	}
-	defer resp.Body.Close()
-	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	fields := []any{"status", resp.Status}
-	if len(detail) > 0 {
-		fields = append(fields, "body", strings.TrimSpace(string(detail)))
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		slog.Warn("linphonepush rejected", fields...)
-		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			slog.Warn("linphonepush hint: API Key 无效/过期/IP 变化 —— 在 Mac 上重新登录 subscribe.linphone.org 生成并更新 ~/.cellbridge/linphone_push_key")
+
+	// 双栈：奇数轮走系统默认（v6 优先，对齐浏览器生成 Key 时的出口），
+	// 偶数轮强制 v4。哪一栈与 Key 绑定的 IP 一致，哪一栈就会 2xx。
+	try := func(client *http.Client) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
 		}
-		return
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("x-api-key", key)
+		// FlexiAPI 要求 From = Key 所属账号的 SIP 地址；缺失或格式不对
+		// （如没带 "sip:" 前缀）都报 401 Invalid API Key，这里统一规范化。
+		if s.linphonePushFrom != "" {
+			from := s.linphonePushFrom
+			if !strings.HasPrefix(from, "sip:") && !strings.HasPrefix(from, "sips:") {
+				from = "sip:" + from
+			}
+			req.Header.Set("From", from)
+		}
+		return client.Do(req)
 	}
-	slog.Info("linphonepush sent", fields...)
+
+	// 401/403 重试 4 轮（v6/v4 交替）：既覆盖「Key 绑在另一栈 IP 上」，
+	// 也覆盖 FlexiAPI 多节点偶发的不一致。
+	for attempt := 1; attempt <= 4; attempt++ {
+		client := linphoneHTTPClient
+		stack := "v6"
+		if attempt%2 == 0 {
+			client = linphoneHTTPClientV4
+			stack = "v4"
+		}
+		resp, err := try(client)
+		if err != nil {
+			// 单栈网络故障（如 v6 临时地址正在轮换）不该放弃整次推送：
+			// 换另一条栈继续重试。
+			slog.Warn("linphonepush failed", "stack", stack, "err", err)
+			if attempt < 4 {
+				time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+				continue
+			}
+			return
+		}
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		fields := []any{"status", resp.Status, "stack", stack}
+		if len(detail) > 0 {
+			fields = append(fields, "body", strings.TrimSpace(string(detail)))
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			slog.Info("linphonepush sent", fields...)
+			return
+		}
+		slog.Warn("linphonepush rejected", append(fields, "attempt", attempt)...)
+		if resp.StatusCode != 401 && resp.StatusCode != 403 {
+			return
+		}
+		if attempt < 4 {
+			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+			continue
+		}
+		slog.Warn("linphonepush hint: v6 与 v4 都 401 —— Key 绑定的出口 IP 已变（家宽 v6 临时地址轮换 / 出口切换）。请在 Mac 浏览器重新生成 API Key（见 README）")
+	}
 }
 
 // pushMu/pushRegs 保护按用户名缓存的推送参数；handleRegister 写，
@@ -165,11 +294,12 @@ func (s *Server) storePushParams(username string, pp pushParams, expires int) {
 	if s.pushRegs == nil {
 		s.pushRegs = make(map[string]pushParams)
 	}
-	if expires <= 0 || !pp.valid() {
-		delete(s.pushRegs, username)
-		return
+	// 手机休眠/锁屏时会以 expires=0 unregister；此时若清掉 pn 参数，后续
+	// 锁屏来电就再也唤醒不了。因此只在拿到有效参数时覆盖，永不主动删除
+	// （单设备部署下陈旧参数无害，FlexiAPI 推不到会直接报错）。
+	if pp.valid() {
+		s.pushRegs[username] = pp
 	}
-	s.pushRegs[username] = pp
 }
 
 // pushFor 返回某用户当前注册的推送参数（没有则 ok=false）。
@@ -207,6 +337,20 @@ func (s *Server) wakeLinphoneClients(callID string) bool {
 	}
 	if sent {
 		slog.Info("linphonepush waking clients", "call", callID, "targets", len(all))
+		return sent
+	}
+	// 没有任何客户端在 cellbridge 注册里带 pn 参数（Linphone 默认只在
+	// sip.linphone.org 那一侧带），退化为「按账号推送」：pn_param/pn_prid
+	// 留空，FlexiAPI 推给 linphone_push_from 账号在 sip.linphone.org 上注册的
+	// 设备。这样锁屏/休眠也能唤醒，不依赖手机把 token 报到 cellbridge。
+	if s.linphonePushFrom != "" {
+		sent = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendLinphonePush(pushParams{Provider: "apns"}, callID)
+		}()
+		slog.Info("linphonepush waking clients (account-based fallback)", "call", callID, "from", s.linphonePushFrom)
 	}
 	return sent
 }
