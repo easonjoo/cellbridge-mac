@@ -141,12 +141,27 @@ find_voiceruntime() {
   return 1
 }
 
-# adb shell 在部分版本/设备上**不传递远端退出码**（恒返回 0）。本项目曾因此把
-# 「声卡缺失」「语音路由未写入」误判为成功：整套服务横幅照常打印"已启动"，
-# 实际模块侧无声卡、无路由 → 每通电话蜂窝侧全零静音（2026-09-12 实测）。
-# 因此远端检查一律用**输出判据**，禁止依赖 adb shell 的退出码。
+# 远端判据（2026-09-12 连续踩两次坑后固化）：
+#   ① adb shell 在部分版本/设备上**不传递远端退出码**（恒返回 0）→ 不能用 if 判成败；
+#   ② **远端 stderr 会被 adb shell 合并进本机 stdout** → `ls` 的
+#      "No such file or directory" 会变成"非空输出"，把「缺失」误判成「存在」。
+# 所以：一律用「输出判据」，且远端命令必须自带 2>/dev/null（remote_has 已代为追加，
+# 仅对它接收的单条命令有效）。这两点曾导致无声卡/无路由被误报为「启动正常」。
 remote_out() { adb shell "$1" 2>/dev/null | tr -d '\r'; }
-remote_has() { [ -n "$(remote_out "$1")" ]; }
+remote_has() { [ -n "$(remote_out "$1 2>/dev/null")" ]; }
+# 等模块侧声卡真正可用：/dev 节点由 ueventd **异步**创建，insmod 成功后可能滞后数十秒，
+# 且 mixer 未就绪时写路由必然全败。最多等 $1 秒（默认 30），就绪返回 0。
+wait_audio_ready() {
+  _i=0
+  while [ "$_i" -lt "${1:-30}" ]; do
+    if remote_has 'ls /dev/snd/controlC0' \
+       && [ -n "$(remote_out '/data/mini_tinymix get "AFE_PCM_RX_Voice Mixer CSVoice" 2>/dev/null')" ]; then
+      return 0
+    fi
+    sleep 1; _i=$((_i + 1))
+  done
+  return 1
+}
 
 # --- 模块声卡驱动自愈 ---
 # 模块（QDC507）重启后内核模块全部清空，声卡 .ko 不会自动加载，表现为
@@ -161,10 +176,9 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
     echo "    模块声卡缺失（模块重启过？）→ 自动加载驱动…"
     adb push "$KO_DIR/qdc507_aprv3.ko" /data/qdc507_aprv3.ko >/dev/null 2>&1
     adb push "$KO_DIR/qdc507_voice.ko" /data/qdc507_voice.ko >/dev/null 2>&1
-    if adb shell 'insmod /data/qdc507_aprv3.ko 2>/dev/null; insmod /data/qdc507_voice.ko 2>/dev/null' >/dev/null 2>&1 \
-       && remote_has 'ls /dev/snd/controlC0'; then
+    adb shell 'insmod /data/qdc507_aprv3.ko 2>/dev/null; insmod /data/qdc507_voice.ko 2>/dev/null' >/dev/null 2>&1
+    if wait_audio_ready 30; then
       echo "    声卡驱动已加载（qdc507_aprv3 + qdc507_voice）"
-      sleep 1
     else
       echo "    警告：声卡驱动加载失败（通话可能无蜂窝音频，重启模块后重试）"
     fi
@@ -178,6 +192,8 @@ fi
 echo "[0/3] 写入语音路由（AFE_PCM ↔ 全部语音会话类型）..."
 if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb" ]; then
   export PATH="$HOME/Applications/platform-tools:$PATH"
+  # 声卡未就绪时写路由必败（历史实现还会误报成功）→ 先等它就绪
+  wait_audio_ready 30 || echo "    警告：声卡 30s 内未就绪，路由写入可能失败"
   adb shell '
     [ -x /data/mini_tinymix ] || exit 0
     T=/data/mini_tinymix
@@ -190,9 +206,10 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
     $T set "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" 1
     $T set "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2" 1
   ' >/dev/null 2>&1
-  # 回读校验（同样不信任 adb shell 退出码）：8 条路由必须全部回读为 1
-  ROUTE_N="$(remote_out 'n=0; T=/data/mini_tinymix; for r in "AFE_PCM_RX_Voice Mixer CSVoice" "AFE_PCM_RX_Voice Mixer VoLTE" "AFE_PCM_RX_Voice Mixer VoiceMMode1" "AFE_PCM_RX_Voice Mixer VoiceMMode2" "Voice_Tx Mixer AFE_PCM_TX_Voice" "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2"; do [ "$($T get "$r" 2>/dev/null)" = "1" ] && n=$((n+1)); done; echo "$n"')"
-  if [ "${ROUTE_N:-0}" = "8" ]; then
+  # 回读校验（不信任退出码）：8 条路由必须全部回读为 1。用 ROUTED= 标记取值，
+  # 避免远端错误文本混入结果造成误判。
+  ROUTE_N="$(remote_out 'n=0; T=/data/mini_tinymix; for r in "AFE_PCM_RX_Voice Mixer CSVoice" "AFE_PCM_RX_Voice Mixer VoLTE" "AFE_PCM_RX_Voice Mixer VoiceMMode1" "AFE_PCM_RX_Voice Mixer VoiceMMode2" "Voice_Tx Mixer AFE_PCM_TX_Voice" "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2"; do [ "$($T get "$r" 2>/dev/null)" = "1" ] && n=$((n+1)); done; echo "ROUTED=$n"' | sed -n 's/.*ROUTED=\([0-9][0-9]*\).*/\1/p')"
+  if [ "${ROUTE_N:-none}" = "8" ]; then
     echo "    语音路由已写入（回读校验 8/8）"
   else
     echo "    警告：语音路由仅 ${ROUTE_N:-0}/8 生效（模块未连接 / 声卡缺失？）"
@@ -204,7 +221,14 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
   # 实测（2026-09-10）：该桥的 --voice-route-session 只对「第一通」电话生效，
   # 之后 DSP 不再往 hw:0,4 送数据 → 蜂窝侧全零、双向哑。故启动时必须**强制
   # 重挂**（旧实现「已在跑就跳过」，导致重启整套服务也修不好第二通）。
-  "$DIR/mavo-route.sh" start 2>/dev/null | sed 's/^/    /' || true
+  # 声卡刚就绪时桥仍可能因 hw:0,4 打开失败而退出 → 重试 3 次
+  _ri=0
+  while [ "$_ri" -lt 3 ]; do
+    _rout="$("$DIR/mavo-route.sh" start 2>&1 | tail -1)"
+    printf '    %s\n' "$_rout"
+    case "$_rout" in *已重新挂载*) break ;; esac
+    sleep 2; _ri=$((_ri + 1))
+  done
   adb shell 'pidof mavo-pcm-bridge >/dev/null && echo "    mavo-pcm-bridge 运行中" || echo "    警告：mavo-pcm-bridge 未运行"' 2>/dev/null
   # 部署路由自愈脚本到模块（每次覆盖写入，保证内容升级能生效）
   #
