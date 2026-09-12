@@ -48,9 +48,15 @@ case "${1:-}" in
   *)
     mkdir -p "$HOME/.cellbridge"
     printf '%s' "$1" > "$KEY_FILE" && chmod 600 "$KEY_FILE"
-    FROM="${2:-yourname@sip.linphone.org}"
-    printf '%s' "$FROM" > "$HOME/.cellbridge/linphone_push_from" && chmod 600 "$HOME/.cellbridge/linphone_push_from"
-    [ -n "${2:-}" ] && printf '%s' "$2" > "$URL_FILE"
+    # 仅在显式传入时才更新 from / 自定义端点；否则保留既有配置，
+    # 避免只换 Key 时把 linphone_push_from 清成占位符（曾导致 From 错误）。
+    if [ -n "${2:-}" ]; then
+      printf '%s' "$2" > "$HOME/.cellbridge/linphone_push_from" && chmod 600 "$HOME/.cellbridge/linphone_push_from"
+    fi
+    if [ -n "${3:-}" ]; then
+      printf '%s' "$3" > "$URL_FILE"
+    fi
+    [ -s "$HOME/.cellbridge/linphone_push_from" ] || printf '%s' 'yourname@sip.linphone.org' > "$HOME/.cellbridge/linphone_push_from"
     echo "已写入 $KEY_FILE（重启 ./start_cellbridge.sh 后生效）"
     ;;
 esac
