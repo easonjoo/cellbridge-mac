@@ -218,6 +218,8 @@ func (s *Server) sendLinphonePush(pp pushParams, callID string) {
 	if err != nil {
 		return
 	}
+	// 诊断：打印完整 payload 和实际发送的 key（完整字符串），排查发送内容与 curl 测试差异。
+	slog.Info("linphonepush body", "key_full", key, "body", string(payload))
 
 	// 双栈：奇数轮走系统默认（v6 优先，对齐浏览器生成 Key 时的出口），
 	// 偶数轮强制 v4。哪一栈与 Key 绑定的 IP 一致，哪一栈就会 2xx。
@@ -229,8 +231,8 @@ func (s *Server) sendLinphonePush(pp pushParams, callID string) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("x-api-key", key)
-		// FlexiAPI 要求 From = Key 所属账号的 SIP 地址；缺失或格式不对
-		// （如没带 "sip:" 前缀）都报 401 Invalid API Key，这里统一规范化。
+		// FlexiAPI 要求 From = Key 所属账号的 SIP 地址。
+		// 若未带 "sip:" 前缀则自动补上（裸 user@domain 格式 FlexiAPI 不认）。
 		if s.linphonePushFrom != "" {
 			from := s.linphonePushFrom
 			if !strings.HasPrefix(from, "sip:") && !strings.HasPrefix(from, "sips:") {
@@ -271,15 +273,16 @@ func (s *Server) sendLinphonePush(pp pushParams, callID string) {
 			slog.Info("linphonepush sent", fields...)
 			return
 		}
-		slog.Warn("linphonepush rejected", append(fields, "attempt", attempt)...)
+		// 非 401/403 立即返回（如 422 参数错误、502 服务器错误）
 		if resp.StatusCode != 401 && resp.StatusCode != 403 {
+			slog.Warn("linphonepush unexpected response", fields...)
 			return
 		}
+		slog.Warn("linphonepush rejected", fields...)
 		if attempt < 4 {
 			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
 			continue
 		}
-		slog.Warn("linphonepush hint: v6 与 v4 都 401 —— Key 绑定的出口 IP 已变（家宽 v6 临时地址轮换 / 出口切换）。请在 Mac 浏览器重新生成 API Key（见 README）")
 	}
 }
 
