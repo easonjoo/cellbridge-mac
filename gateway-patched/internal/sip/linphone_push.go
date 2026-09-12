@@ -218,9 +218,6 @@ func (s *Server) sendLinphonePush(pp pushParams, callID string) {
 	if err != nil {
 		return
 	}
-	// 诊断：打印完整 payload 和实际发送的 key（完整字符串），排查发送内容与 curl 测试差异。
-	slog.Info("linphonepush body", "key_full", key, "body", string(payload))
-
 	// 双栈：奇数轮走系统默认（v6 优先，对齐浏览器生成 Key 时的出口），
 	// 偶数轮强制 v4。哪一栈与 Key 绑定的 IP 一致，哪一栈就会 2xx。
 	try := func(client *http.Client) (*http.Response, error) {
