@@ -141,6 +141,13 @@ find_voiceruntime() {
   return 1
 }
 
+# adb shell 在部分版本/设备上**不传递远端退出码**（恒返回 0）。本项目曾因此把
+# 「声卡缺失」「语音路由未写入」误判为成功：整套服务横幅照常打印"已启动"，
+# 实际模块侧无声卡、无路由 → 每通电话蜂窝侧全零静音（2026-09-12 实测）。
+# 因此远端检查一律用**输出判据**，禁止依赖 adb shell 的退出码。
+remote_out() { adb shell "$1" 2>/dev/null | tr -d '\r'; }
+remote_has() { [ -n "$(remote_out "$1")" ]; }
+
 # --- 模块声卡驱动自愈 ---
 # 模块（QDC507）重启后内核模块全部清空，声卡 .ko 不会自动加载，表现为
 # /proc/asound/cards 报 "no soundcards"、tinymix 全部写不进、通话蜂窝侧
@@ -148,14 +155,14 @@ find_voiceruntime() {
 # insmod 顺序必须是先 aprv3 后 voice）。
 if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb" ]; then
   export PATH="$HOME/Applications/platform-tools:$PATH"
-  if adb shell 'ls /dev/snd/controlC0 >/dev/null 2>&1'; then
+  if remote_has 'ls /dev/snd/controlC0'; then
     echo "    模块声卡正常"
   elif KO_DIR="$(find_voiceruntime)"; then
     echo "    模块声卡缺失（模块重启过？）→ 自动加载驱动…"
     adb push "$KO_DIR/qdc507_aprv3.ko" /data/qdc507_aprv3.ko >/dev/null 2>&1
     adb push "$KO_DIR/qdc507_voice.ko" /data/qdc507_voice.ko >/dev/null 2>&1
-    if adb shell 'insmod /data/qdc507_aprv3.ko && insmod /data/qdc507_voice.ko' 2>/dev/null \
-       && adb shell 'ls /dev/snd/controlC0 >/dev/null 2>&1'; then
+    if adb shell 'insmod /data/qdc507_aprv3.ko 2>/dev/null; insmod /data/qdc507_voice.ko 2>/dev/null' >/dev/null 2>&1 \
+       && remote_has 'ls /dev/snd/controlC0'; then
       echo "    声卡驱动已加载（qdc507_aprv3 + qdc507_voice）"
       sleep 1
     else
@@ -182,7 +189,14 @@ if command -v adb >/dev/null 2>&1 || [ -x "$HOME/Applications/platform-tools/adb
     $T set "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" 1
     $T set "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" 1
     $T set "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2" 1
-  ' 2>/dev/null && echo "    语音路由已写入" || echo "    警告：语音路由写入失败（模块未连接？）"
+  ' >/dev/null 2>&1
+  # 回读校验（同样不信任 adb shell 退出码）：8 条路由必须全部回读为 1
+  ROUTE_N="$(remote_out 'n=0; T=/data/mini_tinymix; for r in "AFE_PCM_RX_Voice Mixer CSVoice" "AFE_PCM_RX_Voice Mixer VoLTE" "AFE_PCM_RX_Voice Mixer VoiceMMode1" "AFE_PCM_RX_Voice Mixer VoiceMMode2" "Voice_Tx Mixer AFE_PCM_TX_Voice" "VoLTE_Tx Mixer AFE_PCM_TX_VoLTE" "VoiceMMode1_Tx Mixer AFE_PCM_TX_MMode1" "VoiceMMode2_Tx Mixer AFE_PCM_TX_MMode2"; do [ "$($T get "$r" 2>/dev/null)" = "1" ] && n=$((n+1)); done; echo "$n"')"
+  if [ "${ROUTE_N:-0}" = "8" ]; then
+    echo "    语音路由已写入（回读校验 8/8）"
+  else
+    echo "    警告：语音路由仅 ${ROUTE_N:-0}/8 生效（模块未连接 / 声卡缺失？）"
+  fi
   # mavo-pcm-bridge：DSP VoLTE ↔ UAC/USB 的用户态桥（缺它则通话全零静音）。
   # 注意：必须用 pidof 精确匹配（pgrep -f 会自匹配 adb shell 命令行造成假阳性）；
   # 二进制用 nohup 启动可在 adb shell 退出后存活。
