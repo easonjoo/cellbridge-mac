@@ -91,9 +91,6 @@ cd cellbridge-mac
 ├── rebuild-gateway.sh          # 重新拉上游 + 打补丁 + go test + 编译网关
 ├── at_pty_bridge.py            # 模块 USB AT 通道 → PTY 串口桥
 ├── voice_audio_bridge.swift    # 蜂窝 UAC 音频 ↔ FIFO（编译为 voice-audio-bridge）
-├── CellBridgeConsole.swift     # 原生 AppKit 控制台（build_console.sh 构建）
-├── CellBridgeWidget.app/       # 桌面右缘状态小组件（环形仪表，悬停看明细）
-├── widget/                     # 小组件源码（探针聚合器 + 界面）
 ├── mavo-route.sh               # 模块侧 VoLTE 路由会话重挂
 ├── route-rearm.sh              # 通话结束后自动重挂守护（每通电话都跑在新会话上）
 ├── tests/route-rearm-harness.sh# rearm 状态机离线回归（5 场景，无需真机）
